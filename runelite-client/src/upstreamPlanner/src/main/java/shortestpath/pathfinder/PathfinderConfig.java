@@ -993,7 +993,7 @@ public class PathfinderConfig
 				{
 					if (item.getId() >= 0 && item.getQuantity() > 0)
 					{
-						itemsAndQuantities.put(item.getId(), item.getQuantity());
+						itemsAndQuantities.merge(item.getId(), item.getQuantity(), Integer::sum);
 					}
 				}
 			}
@@ -1008,7 +1008,7 @@ public class PathfinderConfig
 				{
 					if (item.getId() >= 0 && item.getQuantity() > 0)
 					{
-						itemsAndQuantities.put(item.getId(), item.getQuantity());
+						itemsAndQuantities.merge(item.getId(), item.getQuantity(), Integer::sum);
 					}
 				}
 			}
@@ -1025,7 +1025,7 @@ public class PathfinderConfig
 				{
 					if (item.getId() >= 0 && item.getQuantity() > 0)
 					{
-						itemsAndQuantities.put(item.getId(), item.getQuantity());
+						itemsAndQuantities.merge(item.getId(), item.getQuantity(), Integer::sum);
 					}
 				}
 			}
@@ -1043,7 +1043,7 @@ public class PathfinderConfig
 					int runeAmount = client.getVarbitValue(RUNE_POUCH_AMOUNT_VARBITS[i]);
 					if (runeId > 0 && runeAmount > 0)
 					{
-						itemsAndQuantities.put(runeId, runeAmount);
+						itemsAndQuantities.merge(runeId, runeAmount, Integer::sum);
 					}
 				}
 			}
@@ -1125,7 +1125,7 @@ public class PathfinderConfig
 		String treeName = getPlantedSpiritTreeName(x, y);
 		if (treeName == null)
 		{
-			return false; // 
+			return false;
 		}
 		if (availableSpiritTrees == null)
 		{

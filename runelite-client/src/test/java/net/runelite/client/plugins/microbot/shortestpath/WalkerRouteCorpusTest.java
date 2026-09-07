@@ -608,11 +608,42 @@ public class WalkerRouteCorpusTest {
     public void shantaySouthbound_withNothing_neverCrossesTheGate() {
         List<WorldPoint> path = route(configWith(WalkerRouteCorpusTest::unrestricted),
                 NORTH_OF_GATE, SOUTH_OF_GATE);
-        // Same predicate as the positive tests. The old form required BOTH tiles either side of the
-        // gate at radius 0, so a diagonal step across the gate satisfied neither and the assertion
-        // passed while the route did cross.
-        assertFalse("without a ticket or coins the route must not cross the gate",
-                visits(path, GATE, 2));
+        // Crossing means a path tile strictly SOUTH of the gate line at the pass. The previous
+        // proximity proxy (visits within 2 of the gate) also failed a route that walks UP TO the
+        // gate's north side and stops — which is exactly what the sealed-target fast path now
+        // produces, and exactly what a player without coins does. (The proxy before THAT required
+        // both flanking tiles at radius 0 and missed a diagonal crossing; measuring the crossing
+        // itself ends the proxy games.)
+        boolean crossed = path.stream().anyMatch(p -> p != null
+                && p.getPlane() == GATE.getPlane()
+                && p.getY() < GATE.getY()
+                && Math.abs(p.getX() - GATE.getX()) <= 4);
+        assertFalse("without a ticket or coins the route must not cross the gate", crossed);
+        assertFalse("without a ticket or coins the route must not arrive south",
+                arrives(path, SOUTH_OF_GATE, 3));
+    }
+
+    // ---- Varrock museum interior (the Kudos dead-end) ----------------------------------------------
+
+    /**
+     * The museum guard barrier (24536) is a MOVES-YOU gate, measured 2026-08-08 through the agent
+     * server: one click on "Open" relocates the player across it (3447 -> 3446 -> 3447, reproduced
+     * three times) and the gate never enters an open state, so the runtime door pipeline can never
+     * resolve it. Two independent defects kept the museum interior unroutable: restrictions.tsv
+     * banned the doorway tiles outright (planner could not stand there), and the barrier had no
+     * catalog rows (executor had nothing to click). Assert the route SELECTS the transport rather
+     * than merely passing near the gate tile — an earlier version of this test checked proximity and
+     * would have passed on a route that never crossed.
+     */
+    @Test
+    public void varrockMuseumGuardBarrierIsATransport() {
+        PathfinderConfig config = configWith(WalkerRouteCorpusTest::unrestricted);
+        Pathfinder pf = runPathfinder(config,
+                new WorldPoint(3261, 3449, 0), new WorldPoint(3261, 3443, 0));
+        assertTrue("route across the museum barrier must select gate 24536",
+                selectsTransportObject(pf, 24536));
+        assertTrue("route must arrive south of the barrier",
+                arrives(pf.getPath(), new WorldPoint(3261, 3443, 0), 1));
     }
 
     // ---- Port Sarim, Wydin's shop (the door-poisoning incident) ------------------------------------

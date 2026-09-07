@@ -69,9 +69,9 @@ public class Pathfinder implements Runnable {
     //      diverge tile-by-tile between successive searches with the same endpoints.
     //      Kills the deterministic "identical route every trip" fingerprint.
     private final Queue<Node> boundary = new PriorityQueue<>(4096, NODE_ORDER);
-    private final Queue<Node> pending = new PriorityQueue<>(256);
+    private final Queue<Node> pending = new PriorityQueue<>(256, NODE_ORDER);
     private final Queue<Node> boundaryBackward = new PriorityQueue<>(4096, NODE_ORDER);
-    private final Queue<Node> pendingBackward = new PriorityQueue<>(256);
+    private final Queue<Node> pendingBackward = new PriorityQueue<>(256, NODE_ORDER);
     private VisitedTiles visited;
 
     private volatile List<WorldPoint> path = Collections.emptyList();
@@ -148,6 +148,10 @@ public class Pathfinder implements Runnable {
         Objects.requireNonNull(terminationReason, "terminationReason");
         if (!path.isEmpty() && !start.equals(path.get(0))) {
             throw new IllegalArgumentException("materialized route must start at the requested start");
+        }
+        if (terminationReason == PathTerminationReason.TARGET_REACHED
+                && (path.isEmpty() || !targets.contains(path.get(path.size() - 1)))) {
+            throw new IllegalArgumentException("reached route must end at a requested target");
         }
         if (selectedPathCost < -1L || searchNanos < -1L || nodesChecked < -1L
                 || transportsChecked < -1L || liveCollisionEdgesChecked < -1L) {
@@ -311,6 +315,216 @@ public class Pathfinder implements Runnable {
         return best;
     }
 
+    // ---- sealed-target fast path ---------------------------------------------------------------
+
+    /** Reverse-flood budget: clears any fenced yard or walled room in well under this, ~1-3ms. */
+    private static final int SEALED_PROBE_NODE_BUDGET = 1024;
+    private static final int SEALED_SUBSTITUTE_TARGET_CAP = 8;
+    /** The rim substitutes can themselves prove unreachable; they get a short leash, not 18s. */
+    private static final long SEALED_SUBSTITUTE_CUTOFF_MS = 2_000L;
+    /**
+     * Node budget for the substitute pass. The time leash alone still allowed a 2-million-node flood
+     * (a sealed moat tile whose rim is itself an unreachable pocket): two seconds at search speed IS
+     * the flood. Truncating a genuinely long approach to a sealed destination is fine — the walker
+     * walks the partial path, replans closer, and the next probe answers from nearer.
+     */
+    private static final long SEALED_SUBSTITUTE_NODE_BUDGET = 50_000L;
+    /**
+     * Budget when {@link SealedVerdictMemo} already holds a fresh rim-unreachable proof for this
+     * goal. The best partial node is found in the first few thousand nodes of a substitute search
+     * (the rest of the full budget is undirected flood); repeats keep nearly all partial quality.
+     */
+    private static final long SEALED_REPEAT_NODE_BUDGET = 5_000L;
+
+    /** The targets the search LOOPS actually chase; equals {@link #targetsPacked} except in sealed mode. */
+    private volatile int[] searchTargetsPacked;
+    private volatile boolean sealedTargetMode;
+    private long sealedSubstituteNodeBudget = SEALED_SUBSTITUTE_NODE_BUDGET;
+    /** Test seam: when > 0, replaces {@link #SEALED_SUBSTITUTE_NODE_BUDGET} for this instance's runs. */
+    private long sealedSubstituteNodeBudgetOverride = -1L;
+    private int sealedMemoKey;
+    private long cutoffOverrideMillis = -1L;
+
+    void setSealedSubstituteNodeBudgetForTest(long budget) {
+        sealedSubstituteNodeBudgetOverride = budget;
+    }
+    /** See {@link #getReachedSealedSubstitute()}. Volatile: written by the search thread, read by the walker. */
+    private volatile int reachedSealedSubstitutePacked = -1;
+
+    private long effectiveCutoffMillis() {
+        long configured = config.getCalculationCutoffMillis();
+        return cutoffOverrideMillis > 0 ? Math.min(cutoffOverrideMillis, configured) : configured;
+    }
+
+    /**
+     * The rim substitute the sealed-target search actually REACHED, or {@code null}. Non-null only
+     * when the destination was proven sealed AND the substitute pass ended ON a walkable rim tile —
+     * i.e. this run's path is a complete route to the closest standable spot beside the sealed
+     * pocket. The walker uses it to retarget the walk to the rim ONCE: without that, the
+     * SEARCH_EXHAUSTED termination made every pass treat the plan as partial and replan it, and
+     * each replan re-ran this substitute search — the 17:54 walk burned 50k nodes per replan
+     * crawling ~300 tiles toward a destination one tile inside a fence.
+     */
+    public WorldPoint getReachedSealedSubstitute() {
+        int packed = reachedSealedSubstitutePacked;
+        return packed == -1 ? null : WorldPointUtil.unpackWorldPoint(packed);
+    }
+
+    /**
+     * The nearest walkable rim tile of a PROVEN-sealed destination, or {@code null} when this run
+     * was not a sealed-target run. Available even when the substitute search never REACHED the rim:
+     * the substitute node budget covers a ~125-tile flood radius, so a sealed goal further away
+     * than that exhausts every search en route and the whole journey degrades to a partial crawl —
+     * measured Falador->Burthorpe against a clicked hatch tile, one truncated 50k-node search per
+     * pass, ending outside the pub's south wall. The rim tiles themselves are ORDINARY reachable
+     * tiles; the walker retargets to this one and plans it as a normal full-budget search instead.
+     */
+    public WorldPoint getNearestSealedRimSubstitute() {
+        int[] chased = searchTargetsPacked;
+        if (!sealedTargetMode || chased == null || chased.length == 0) {
+            return null;
+        }
+        // Nearest to the search start by construction (see sealedTargetSubstitutes' sort).
+        return WorldPointUtil.unpackWorldPoint(chased[0]);
+    }
+
+    /**
+     * Bounded reverse flood from the single target, deciding whether its graph component is provably
+     * SEALED — unreachable by walking, by any transport whose origin exists, and not landed in by any
+     * anywhere-teleport.
+     * <p>
+     * Exists because an unreachable destination made the forward search flood the ENTIRE world
+     * component before giving up: measured 37 times in one evening at ~1.1M nodes and 1.2-3.8s of CPU
+     * each, mostly for destinations TWO TILES away (a sealed map-data tile, or an interaction target
+     * the caller asked for by coordinate). The reverse flood explores only the target's own component,
+     * which for every observed case is tiny, and answers in ~1ms.
+     * <p>
+     * Correctness leans on three things. The flood uses {@code getReverseNeighbors} with the
+     * incoming-transports index, so a room entered by a staircase or door transport GROWS past its
+     * walls and reads reachable — an upstairs destination is never falsely sealed. Anywhere-teleports
+     * (null origin, excluded from that index) are checked per component tile instead. And the budget
+     * makes big components INCONCLUSIVE rather than sealed: only a frontier that genuinely drains
+     * under budget without touching {@code start} proves anything.
+     *
+     * @return {@code null} when reachable or inconclusive (run the normal search); otherwise the
+     * component's walkable rim — same-plane cardinal neighbours just outside it with at least one
+     * open edge — nearest-first to the goal, possibly empty (a void tile with a void rim).
+     */
+    private int[] sealedTargetSubstitutes(int goalPacked) {
+        final Map<Integer, Set<Transport>> incoming = new HashMap<>(512);
+        final Set<Integer> anywhereTeleportDests = new HashSet<>();
+        for (Map.Entry<WorldPoint, Set<Transport>> e : config.getTransports().entrySet()) {
+            for (Transport t : e.getValue()) {
+                if (t.getDestination() == null) {
+                    continue;
+                }
+                int dp = WorldPointUtil.packWorldPoint(t.getDestination());
+                if (t.getOrigin() == null) {
+                    anywhereTeleportDests.add(dp);
+                } else {
+                    incoming.computeIfAbsent(dp, k -> new HashSet<>()).add(t);
+                }
+            }
+        }
+        final Set<Integer> puzzleAllow = new HashSet<>(4);
+        puzzleAllow.add(goalPacked);
+        puzzleAllow.add(start);
+        final VisitedTiles probeVisited = new VisitedTiles(map);
+        final ArrayDeque<Node> frontier = new ArrayDeque<>();
+        final Set<Integer> component = new LinkedHashSet<>();
+        frontier.add(new Node(goalPacked, null));
+        probeVisited.set(goalPacked);
+        int expanded = 0;
+        while (!frontier.isEmpty()) {
+            if (expanded >= SEALED_PROBE_NODE_BUDGET) {
+                return null; // big component: inconclusive, let the real search decide
+            }
+            Node n = frontier.poll();
+            expanded++;
+            if (anywhereTeleportDests.contains(n.packedPosition)) {
+                return null; // an anywhere-teleport lands inside: reachable
+            }
+            component.add(n.packedPosition);
+            for (Node pred : map.getReverseNeighbors(n, probeVisited, config, puzzleAllow, incoming)) {
+                if (pred.packedPosition == start) {
+                    return null; // reachable
+                }
+                probeVisited.set(pred.packedPosition);
+                frontier.add(pred);
+            }
+        }
+
+        final int[][] dirs = {{1, 0}, {-1, 0}, {0, 1}, {0, -1}};
+        final Set<Integer> rim = new LinkedHashSet<>();
+        for (int packed : component) {
+            final int x = WorldPointUtil.unpackWorldX(packed);
+            final int y = WorldPointUtil.unpackWorldY(packed);
+            final int z = WorldPointUtil.unpackWorldPlane(packed);
+            for (int[] d : dirs) {
+                final int nx = x + d[0];
+                final int ny = y + d[1];
+                final int np = WorldPointUtil.packWorldPoint(nx, ny, z);
+                if (component.contains(np) || rim.contains(np)) {
+                    continue;
+                }
+                for (int[] out : dirs) {
+                    if (map.canStep(nx, ny, z, out[0], out[1])) {
+                        rim.add(np);
+                        break;
+                    }
+                }
+            }
+        }
+        // Nearest to START, not to the goal: the reachable rim is on the approach side, and ranking
+        // it first lets the substitute search REACH a target in hundreds of nodes. Goal-side rim
+        // tiles are usually inside the sealed pocket's far side — unreachable by construction — and
+        // ranking them first burned the whole substitute node budget on best-effort (measured 50k
+        // nodes at Shantay Pass vs a direct walk to the near-side rim).
+        final List<Integer> nearest = new ArrayList<>(rim);
+        nearest.sort(Comparator.comparingInt(p -> WorldPointUtil.distanceBetween(p, start)));
+        final int take = Math.min(SEALED_SUBSTITUTE_TARGET_CAP, nearest.size());
+        final int[] substitutes = new int[take];
+        for (int i = 0; i < take; i++) {
+            substitutes[i] = nearest.get(i);
+        }
+        WebWalkLog.pf("target_sealed dst={} component={} rim={} probeNodes={}",
+                WorldPointUtil.toString(goalPacked), component.size(), rim.size(), expanded);
+        return substitutes;
+    }
+
+    /**
+     * A sealed component's nearest rim tile can itself be another sealed map-data tile. Resolve
+     * those nested shells here, before publishing a substitute to the walker, so one requested goal
+     * produces one effective approach target instead of a chain of recursive retargets.
+     */
+    private int[] normalizeSealedRim(int[] initial) {
+        List<Integer> current = Arrays.stream(initial).boxed().collect(Collectors.toList());
+        Set<Integer> probed = new HashSet<>();
+        for (int depth = 0; depth < 4 && !current.isEmpty(); depth++) {
+            int candidate = current.get(0);
+            if (!probed.add(candidate)) {
+                break;
+            }
+            int[] nested = sealedTargetSubstitutes(candidate);
+            if (nested == null || nested.length == 0) {
+                break;
+            }
+            LinkedHashSet<Integer> next = new LinkedHashSet<>(current);
+            next.remove(candidate);
+            for (int substitute : nested) {
+                if (!probed.contains(substitute)) {
+                    next.add(substitute);
+                }
+            }
+            current = new ArrayList<>(next);
+            current.sort(Comparator.comparingInt(p -> WorldPointUtil.distanceBetween(p, start)));
+            if (current.size() > SEALED_SUBSTITUTE_TARGET_CAP) {
+                current = new ArrayList<>(current.subList(0, SEALED_SUBSTITUTE_TARGET_CAP));
+            }
+        }
+        return current.stream().mapToInt(Integer::intValue).toArray();
+    }
+
     private void buildIncomingByDestination(Map<Integer, Set<Transport>> out) {
         out.clear();
         for (Map.Entry<WorldPoint, Set<Transport>> e : config.getTransports().entrySet()) {
@@ -402,7 +616,7 @@ public class Pathfinder implements Runnable {
 
         int bestDistance = Integer.MAX_VALUE;
         long bestHeuristic = Integer.MAX_VALUE;
-        long cutoffDurationMillis = config.getCalculationCutoffMillis();
+        long cutoffDurationMillis = effectiveCutoffMillis();
         long cutoffTimeMillis = System.currentTimeMillis() + cutoffDurationMillis;
         config.refreshTeleports(start, 31);
         boolean reachedGoal = false;
@@ -439,7 +653,7 @@ public class Pathfinder implements Runnable {
 
             final int nodePos = node.packedPosition;
             boolean reached = false;
-            for (int target : targetsPacked) {
+            for (int target : searchTargetsPacked) {
                 if (nodePos == target) {
                     bestLastNode = node;
                     reached = true;
@@ -459,9 +673,10 @@ public class Pathfinder implements Runnable {
                 break;
             }
 
-            if (System.currentTimeMillis() > cutoffTimeMillis) {
+            if (System.currentTimeMillis() > cutoffTimeMillis
+                    || (sealedTargetMode && stats.getNodesChecked() > sealedSubstituteNodeBudget)) {
                 timedOut = true;
-                WebWalkLog.pf("cutoff bestDist={} nodes={}", bestDistance, stats.getNodesChecked());
+                WebWalkLog.pf("cutoff bestDist={} nodes={} sealedMode={}", bestDistance, stats.getNodesChecked(), sealedTargetMode);
                 break;
             }
 
@@ -491,12 +706,12 @@ public class Pathfinder implements Runnable {
     }
 
     private void runBidirectional() {
-        int goalPacked = targetsPacked[0];
+        int goalPacked = searchTargetsPacked[0];
         Map<Integer, Set<Transport>> incoming = new HashMap<>(512);
         buildIncomingByDestination(incoming);
 
         Set<Integer> puzzleAllow = new HashSet<>(targets.size() + 1);
-        for (int t : targetsPacked) {
+        for (int t : searchTargetsPacked) {
             puzzleAllow.add(t);
         }
         puzzleAllow.add(start);
@@ -518,7 +733,7 @@ public class Pathfinder implements Runnable {
 
         int bestDistance = Integer.MAX_VALUE;
         long bestHeuristic = Integer.MAX_VALUE;
-        long cutoffDurationMillis = config.getCalculationCutoffMillis();
+        long cutoffDurationMillis = effectiveCutoffMillis();
         long cutoffTimeMillis = System.currentTimeMillis() + cutoffDurationMillis;
         config.refreshTeleports(start, 31);
         boolean timedOut = false;
@@ -563,7 +778,7 @@ public class Pathfinder implements Runnable {
                     break;
                 }
 
-                for (int target : targetsPacked) {
+                for (int target : searchTargetsPacked) {
                     int distance = WorldPointUtil.distanceBetween(nodePos, target);
                     long heuristic = distance + (long) WorldPointUtil.distanceBetween(nodePos, target, 2);
                     if (heuristic < bestHeuristic || (heuristic <= bestHeuristic && distance < bestDistance)) {
@@ -602,9 +817,10 @@ public class Pathfinder implements Runnable {
                 addNeighborsBackwardWithMeet(node, visitedB, incoming, puzzleAllow, forwardAt, backwardAt, bestMeetingCost, meetF, meetB);
             }
 
-            if (System.currentTimeMillis() > cutoffTimeMillis) {
+            if (System.currentTimeMillis() > cutoffTimeMillis
+                    || (sealedTargetMode && stats.getNodesChecked() > sealedSubstituteNodeBudget)) {
                 timedOut = true;
-                WebWalkLog.pf("bidir_cutoff nodes={}", stats.getNodesChecked());
+                WebWalkLog.pf("bidir_cutoff nodes={} sealedMode={}", stats.getNodesChecked(), sealedTargetMode);
                 break;
             }
         }
@@ -658,8 +874,54 @@ public class Pathfinder implements Runnable {
             // thread cannot mix two scenes into one path. No-op when live collision is disabled.
             map.beginSearch();
             stats.start();
+
+            searchTargetsPacked = targetsPacked;
+            sealedTargetMode = false;
+            sealedSubstituteNodeBudget = sealedSubstituteNodeBudgetOverride > 0
+                    ? sealedSubstituteNodeBudgetOverride
+                    : SEALED_SUBSTITUTE_NODE_BUDGET;
+            cutoffOverrideMillis = -1L;
+            reachedSealedSubstitutePacked = -1;
+            if (targetsPacked.length == 1 && targetsPacked[0] != start) {
+                int[] rim = null;
+                try {
+                    rim = sealedTargetSubstitutes(targetsPacked[0]);
+                    if (rim != null && rim.length > 0) {
+                        rim = normalizeSealedRim(rim);
+                    }
+                } catch (RuntimeException probeFailure) {
+                    // The probe is an optimisation; any anomaly degrades to the full search, never
+                    // to a failed run. (First seen with a mocked CollisionMap whose VisitedTiles had
+                    // no region planes.)
+                    log.debug("[Pathfinder] sealed-target probe failed, running full search: {}",
+                            probeFailure.toString());
+                }
+                if (rim != null) {
+                    sealedTargetMode = true;
+                    if (rim.length == 0) {
+                        // A sealed component with a void rim (off-map or instance-template garbage):
+                        // nothing to walk toward, nothing to search for.
+                        WebWalkLog.pf("target_sealed no_walkable_rim dst={}",
+                                WorldPointUtil.toString(targetsPacked[0]));
+                        terminationReason = PathTerminationReason.SEARCH_EXHAUSTED;
+                        return;
+                    }
+                    // Search for the rim instead: the walk still ends beside the sealed area — the
+                    // same best-effort the old full flood produced — at a thousandth of the cost.
+                    searchTargetsPacked = rim;
+                    cutoffOverrideMillis = SEALED_SUBSTITUTE_CUTOFF_MS;
+                    sealedMemoKey = config.getLastTransportRefreshKeyHash();
+                    if (SealedVerdictMemo.isRimUnreachable(targetsPacked[0], sealedMemoKey,
+                            System.currentTimeMillis())) {
+                        sealedSubstituteNodeBudget = SEALED_REPEAT_NODE_BUDGET;
+                        WebWalkLog.pf("sealed_memo repeat dst={} budget={}",
+                                WorldPointUtil.toString(targetsPacked[0]), SEALED_REPEAT_NODE_BUDGET);
+                    }
+                }
+            }
+
             int minCheb = minChebyshevStartToAnyTarget();
-            boolean useBidir = targetsPacked.length == 1
+            boolean useBidir = searchTargetsPacked.length == 1
                     && minCheb >= BIDIRECTIONAL_MIN_CHEBYSHEV;
             pathfinderDiag("run mode decision useBidir=%s minCheb=%d bidirThreshold=%d targetsPacked=%d cutoffMs=%d cancelAlready=%s",
                     useBidir,
@@ -673,6 +935,39 @@ public class Pathfinder implements Runnable {
                 runBidirectional();
             } else {
                 runUnidirectional();
+            }
+            // Reaching a rim substitute is not reaching the caller's target, and the substitute pass
+            // hitting its short leash (the rim itself can be unreachable — a sealed tile inside a
+            // locked interior) changes nothing either: the original destination's unreachability is
+            // already PROVEN, and callers keying decisions off the termination must hear exactly that.
+            // A genuinely REACHED rim is remembered before the remap, though — it is the walker's
+            // signal to retarget the walk to the rim once instead of replaying this search forever.
+            if (sealedTargetMode) {
+                int reachedPacked = -1;
+                if (terminationReason == PathTerminationReason.TARGET_REACHED) {
+                    if (bestLastNode != null) {
+                        reachedPacked = bestLastNode.packedPosition;
+                    } else if (joinedPath != null && !joinedPath.isEmpty()) {
+                        reachedPacked = WorldPointUtil.packWorldPoint(joinedPath.get(joinedPath.size() - 1));
+                    }
+                }
+                if (reachedPacked != -1) {
+                    reachedSealedSubstitutePacked = reachedPacked;
+                    SealedVerdictMemo.clear(targetsPacked[0]);
+                } else if (terminationReason == PathTerminationReason.SEARCH_EXHAUSTED) {
+                    // The frontier genuinely drained without touching the rim: proven unreachable,
+                    // remember it so the partial crawl's replans and script reachability polls stop
+                    // re-proving the same verdict at full price. CUTOFF_REACHED (time leash or node
+                    // budget) proves nothing — a long route can exhaust the budget with the rim
+                    // perfectly reachable, and memoing that dropped every replan to the repeat
+                    // budget, guaranteeing none could ever finish (observed Varlamore→Burthorpe:
+                    // 50k nodes spent at bestDist=112, then 5k-node replans flip-flopping).
+                    SealedVerdictMemo.record(targetsPacked[0], sealedMemoKey, System.currentTimeMillis());
+                }
+                if (terminationReason == PathTerminationReason.TARGET_REACHED
+                        || terminationReason == PathTerminationReason.CUTOFF_REACHED) {
+                    terminationReason = PathTerminationReason.SEARCH_EXHAUSTED;
+                }
             }
         } catch (Exception e) {
             terminationReason = PathTerminationReason.FAILED;

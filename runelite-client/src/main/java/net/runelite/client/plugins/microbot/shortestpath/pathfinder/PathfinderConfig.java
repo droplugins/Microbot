@@ -117,21 +117,6 @@ public class PathfinderConfig {
      * they survive. Loaded once in the constructor; grown by {@link #learnBlockedEdge}.
      */
     private final Set<Long> learnedBlockedEdgeKeys = ConcurrentHashMap.newKeySet();
-    /** Backing file for {@link #learnedBlockedEdgeKeys}; redirectable for tests. */
-    private volatile File learnedBlockedEdgesFile;
-    /**
-     * Two-strike hardening state: every row of the learned store (probation included), in file order,
-     * plus a by-key index for strike accounting. {@link #learnedBlockedEdgeKeys} holds only what is
-     * ENFORCED this session (confirmed rows + this session's own observations). Guarded by
-     * {@link #learnedEdgeLock}.
-     */
-    private final List<LearnedBlockedEdges.Edge> learnedEdgeRows = new ArrayList<>();
-    private final Map<Long, LearnedBlockedEdges.Edge> learnedEdgeRowsByKey = new HashMap<>();
-    private final Object learnedEdgeLock = new Object();
-    /** Observations needed before a learned block survives into LATER sessions. */
-    static final int LEARNED_EDGE_ENFORCE_STRIKES = 2;
-    /** A repeat observation only counts as independent evidence after this long. */
-    static final long LEARNED_EDGE_STRIKE_INDEPENDENCE_MS = 10 * 60_000L;
 
     private final Client client;
     private final ShortestPathConfig config;
@@ -161,6 +146,13 @@ public class PathfinderConfig {
      */
     private volatile int lastComputedInvFingerprint;
     private volatile int previousRefreshInvFingerprint;
+    /**
+     * The transport-refresh cache key computed by the most recent {@code refreshTransports} —
+     * the invalidation key for {@link SealedVerdictMemo} (a verdict proven under one transport
+     * set must not survive into another).
+     */
+    @Getter
+    private volatile int lastTransportRefreshKeyHash;
     /** Which verification component moved on the most recent verify-miss; see the miss log. */
     private volatile String lastVerifyMissDetail = "";
     @Getter
@@ -273,6 +265,11 @@ public class PathfinderConfig {
         this(mapData, transports, restrictions, client, config, TransportPlanningPolicy.ALLOW_ALL);
     }
 
+    /**
+     * Creates pathfinder state. Null client/config dependencies are supported for offline planning
+     * and tests. A null client uses only static collision data, and refresh returns without reading
+     * live state when either dependency is absent.
+     */
     public PathfinderConfig(SplitFlagMap mapData, Map<WorldPoint, Set<Transport>> transports,
                             List<Restriction> restrictions,
                             Client client, ShortestPathConfig config,
@@ -288,8 +285,6 @@ public class PathfinderConfig {
         this.transportsPacked = new PrimitiveIntHashMap<>(allTransports.size() / 2);
         this.blockedTransportEdgesPacked = ConcurrentHashMap.newKeySet();
         addStaticBlockedEdges();
-        this.learnedBlockedEdgesFile = LearnedBlockedEdges.defaultFile();
-        loadLearnedBlockedEdges();
         this.client = client;
         this.config = config;
         this.transportPlanningPolicy = Objects.requireNonNull(
@@ -356,6 +351,9 @@ public class PathfinderConfig {
     }
 
     public void refresh(WorldPoint target) {
+        if (client == null || config == null) {
+            return;
+        }
         calculationCutoffMillis = (long) config.calculationCutoff() * Constants.GAME_TICK_LENGTH;
         avoidWilderness = ShortestPathPlugin.override("avoidWilderness", config.avoidWilderness());
         avoidDangerousNpcs = ShortestPathPlugin.override("avoidDangerousNpcs", config.avoidDangerousNpcs());
@@ -473,6 +471,12 @@ public class PathfinderConfig {
      * @param target Optional target destination for optimized filtering (null for standard filtering)
      */
     private void refreshTransports(WorldPoint target) {
+        // The 1.1s post-login client-thread freeze hid in the UNMEASURED parts of this method: the
+        // stage timers summed to ~30ms while the outer wrapper read 1154ms, and the slow-stage log
+        // never fired. Three regions were dark: this entry block (quest-state + bank/item gates),
+        // the cache-key phase, and the verify/capture block after filtering. Each now has a timer,
+        // carried on both the stage log and the slow log, so the next slow login names its stage.
+        long entryStart = System.currentTimeMillis();
         useFairyRings = ShortestPathPlugin.override("useFairyRings", config.useFairyRings())
                 && !QuestState.NOT_STARTED.equals(Rs2Player.getQuestState(Quest.FAIRYTALE_II__CURE_A_QUEEN))
                 && (Rs2Inventory.contains(ItemID.DRAMEN_STAFF, ItemID.LUNAR_MOONCLAN_LIMINAL_STAFF)
@@ -486,8 +490,14 @@ public class PathfinderConfig {
         useQuetzals = ShortestPathPlugin.override("useQuetzals", config.useQuetzals())
                 && QuestState.FINISHED.equals(Rs2Player.getQuestState(Quest.TWILIGHTS_PROMISE));
 
+        long entryTime = System.currentTimeMillis() - entryStart;
+
+        long keyStart = System.currentTimeMillis();
         final Rs2LeaguesTransport.LeaguesContext leaguesCtx = Rs2LeaguesTransport.leaguesContext();
+        lastKeyLeaguesMs = System.currentTimeMillis() - keyStart;
         final int refreshCacheKeyHash = computeTransportRefreshCacheKeyHash(target, leaguesCtx);
+        lastTransportRefreshKeyHash = refreshCacheKeyHash;
+        long keyTime = System.currentTimeMillis() - keyStart;
 
         TransportRefreshSnapshot snap = transportRefreshSnapshots.get(refreshCacheKeyHash);
         if (snap != null && client != null) {
@@ -692,6 +702,9 @@ public class PathfinderConfig {
             WorldPoint point = entry.getKey();
             Set<Transport> usableTransports = new HashSet<>(entry.getValue().size());
             for (Transport transport : entry.getValue()) {
+                if (transport == null) {
+                    continue;
+                }
                 totalTransports++;
                 updateActionBasedOnQuestState(transport);
 
@@ -738,6 +751,7 @@ public class PathfinderConfig {
                 typeStats);
         long filterTime = System.currentTimeMillis() - filterStart;
 
+        long verifyStart = System.currentTimeMillis();
         int[] sortedVarbitConditions = encodeSortedConditionTriples(varbitConditions);
         int[] sortedVarplayerConditions = encodeSortedConditionTriples(varplayerConditions);
         int[] sortedQuestIds = mergedList.values().stream()
@@ -756,10 +770,13 @@ public class PathfinderConfig {
                 sortedVarbitConditions, sortedVarplayerConditions, sortedQuestIds);
         int[] verificationComponents = computeTransportRefreshVerificationComponents(refreshBoostedLevels,
                 sortedSkillOrdinals, sortedVarbitConditions, sortedVarplayerConditions, sortedQuestIds);
+        long verifyTime = System.currentTimeMillis() - verifyStart;
+        long captureStart = System.currentTimeMillis();
         transportRefreshSnapshots.put(refreshCacheKeyHash, TransportRefreshSnapshot.capture(
                 refreshCacheKeyHash, verificationHash, verificationComponents,
                 sortedSkillOrdinals, sortedVarbitConditions, sortedVarplayerConditions, sortedQuestIds,
                 transports, usableTeleports));
+        long captureTime = System.currentTimeMillis() - captureStart;
 
         long similarStart = System.currentTimeMillis();
         if (useBankItems && config.maxSimilarTransportDistance() > 0) {
@@ -774,17 +791,22 @@ public class PathfinderConfig {
         refreshVarplayerValues = null;
 
         // varbit/varplayer counts = distinct ids referenced by merged transport definitions this refresh, not total client var space.
-        WebWalkLog.cfg("refresh_transports merge={}ms cache={}ms filter={}ms useTrans={}ms similar={}ms total/chk={}/{} usablePost={} vb={} vp={}",
-                mergeTime, cacheTime, filterTime, useTransportTimeNanos / 1_000_000, similarTime,
+        WebWalkLog.cfg("refresh_transports entry={}ms key={}ms merge={}ms cache={}ms filter={}ms useTrans={}ms verify={}ms capture={}ms similar={}ms total/chk={}/{} usablePost={} vb={} vp={}",
+                entryTime, keyTime, mergeTime, cacheTime, filterTime, useTransportTimeNanos / 1_000_000,
+                verifyTime, captureTime, similarTime,
                 totalTransports, checkedTransports, usableTeleports.size(), varbitIds.size(), varplayerIds.size());
 
         // Surface the same breakdown at INFO when the miss is slow enough to be the visible cold
         // start, so the dominant stage is identifiable without enabling debug logging.
-        long refreshTransportsTotalMs = mergeTime + cacheTime + filterTime + similarTime;
+        long refreshTransportsTotalMs = entryTime + keyTime + mergeTime + cacheTime + filterTime
+                + verifyTime + captureTime + similarTime;
         if (refreshTransportsTotalMs >= SLOW_REFRESH_LOG_THRESHOLD_MS) {
-            WebWalkLog.cfgSlow("slow refresh_transports merge={}ms cache={}ms filter={}ms useTrans={}ms similar={}ms total/chk={}/{} vb={} vp={}",
-                    mergeTime, cacheTime, filterTime, useTransportTimeNanos / 1_000_000, similarTime,
+            WebWalkLog.cfgSlow("slow refresh_transports entry={}ms key={}ms merge={}ms cache={}ms filter={}ms useTrans={}ms verify={}ms capture={}ms similar={}ms total/chk={}/{} vb={} vp={}",
+                    entryTime, keyTime, mergeTime, cacheTime, filterTime, useTransportTimeNanos / 1_000_000,
+                    verifyTime, captureTime, similarTime,
                     totalTransports, checkedTransports, varbitIds.size(), varplayerIds.size());
+            WebWalkLog.cfgSlow("slow refresh_transports keyDetail leagues={}ms inv={}ms equip={}ms bank={}ms",
+                    lastKeyLeaguesMs, lastKeyInvMs, lastKeyEquipMs, lastKeyBankMs);
             typeStats.entrySet().stream()
                     .sorted((a, b) -> Integer.compare(b.getValue()[2], a.getValue()[2]))
                     .limit(3)
@@ -856,63 +878,25 @@ public class PathfinderConfig {
     }
 
     /**
-     * (Re)loads the human-editable learned-blocked-edges TSV. Only rows with
-     * {@link #LEARNED_EDGE_ENFORCE_STRIKES}+ strikes are applied to the live block set — a
-     * single-strike row is probation: the session that observed it blocked it at the time, but a
-     * fresh session ignores it until a second independent observation confirms (one bad sample must
-     * not poison the store permanently). A reload drops previously-applied learned keys first so the
-     * test seam can simulate a restart; static blocked edges are re-added and unaffected.
-     */
-    private void loadLearnedBlockedEdges() {
-        synchronized (learnedEdgeLock) {
-            blockedTransportEdgesPacked.removeAll(learnedBlockedEdgeKeys);
-            addStaticBlockedEdges();
-            learnedBlockedEdgeKeys.clear();
-            learnedEdgeRows.clear();
-            learnedEdgeRowsByKey.clear();
-            for (LearnedBlockedEdges.Edge edge : LearnedBlockedEdges.load(learnedBlockedEdgesFile)) {
-                long key = transportEdgeKey(
-                        WorldPointUtil.packWorldPoint(edge.origin),
-                        WorldPointUtil.packWorldPoint(edge.destination));
-                learnedEdgeRows.add(edge);
-                learnedEdgeRowsByKey.put(key, edge);
-                boolean enforced = edge.strikes >= LEARNED_EDGE_ENFORCE_STRIKES;
-                if (enforced) {
-                    learnedBlockedEdgeKeys.add(key);
-                    blockedTransportEdgesPacked.add(key);
-                } else {
-                    log.debug("[Walker] Learned edge on probation (strike {}/{}), not enforced: {} -> {}",
-                            edge.strikes, LEARNED_EDGE_ENFORCE_STRIKES, edge.origin, edge.destination);
-                }
-                if (edge.bidirectional) {
-                    long reverse = transportEdgeKey(
-                            WorldPointUtil.packWorldPoint(edge.destination),
-                            WorldPointUtil.packWorldPoint(edge.origin));
-                    learnedEdgeRowsByKey.putIfAbsent(reverse, edge);
-                    if (enforced) {
-                        learnedBlockedEdgeKeys.add(reverse);
-                        blockedTransportEdgesPacked.add(reverse);
-                    }
-                }
-            }
-        }
-    }
-
-    /**
-     * Records a walking edge the walker just failed to traverse (e.g. a door that moved the player the
-     * wrong way). The observing session blocks the edge immediately — it just watched the failure, and
-     * anything less loops the walker into the same door. PERSISTENCE is two-strike gated: the row is
-     * written on probation (strike 1) and later sessions ignore it until a second observation at least
-     * {@link #LEARNED_EDGE_STRIKE_INDEPENDENCE_MS} later confirms it. One bad sample (the Wydin door
-     * poisoning) therefore self-heals on restart instead of requiring a hand-edit.
-     *
-     * <p>Only the attempted direction is blocked — not bidirectionally — so a genuinely one-way door
-     * stays usable the other way. Callers must only pass <em>stable</em> map properties here; temporary,
-     * quest/skill-gated doors are handled by {@code restrictions.tsv} and must not be learned, or the
-     * bot would avoid them forever after the requirement is met.
+     * Records a walking edge the walker just failed to traverse (e.g. a door that moved the player
+     * the wrong way, or a route click the reachability net proved walled). The observing session
+     * blocks the edge immediately — it just watched the failure, and anything less loops the walker
+     * into the same obstacle.
+     * <p>
+     * SESSION-ONLY by policy (2026-08-07): nothing is persisted, and nothing learned in an earlier
+     * session is loaded. The hand-curated {@code blocked_edges.tsv} is the sole cross-session
+     * authority. The two-strike persistent store this replaces spent its history managing its own
+     * failure modes — the Wydin door poisoning needed probation semantics to self-heal, and the
+     * store's default file leaked developer state into every test that built a config. An edge worth
+     * remembering across sessions is worth a reviewed TSV row.
+     * <p>
+     * Only the attempted direction is blocked — not bidirectionally — so a genuinely one-way door
+     * stays usable the other way. Callers must only pass <em>stable</em> map properties here;
+     * temporary, quest/skill-gated doors are handled by {@code restrictions.tsv} and must not be
+     * learned, or the bot would avoid them for the rest of the session after the requirement is met.
      *
      * @return {@code true} if this edge was newly blocked for this session; {@code false} if it was
-     * already enforced.
+     * already blocked.
      */
     public boolean learnBlockedEdge(WorldPoint origin, WorldPoint destination, String reason) {
         if (origin == null || destination == null) {
@@ -925,43 +909,33 @@ public class PathfinderConfig {
             return false;
         }
         blockedTransportEdgesPacked.add(key);
-        long now = System.currentTimeMillis();
-        synchronized (learnedEdgeLock) {
-            LearnedBlockedEdges.Edge existing = learnedEdgeRowsByKey.get(key);
-            if (existing == null) {
-                LearnedBlockedEdges.Edge row = new LearnedBlockedEdges.Edge(
-                        origin, destination, false, reason == null ? "" : reason, 1, now);
-                learnedEdgeRows.add(row);
-                learnedEdgeRowsByKey.put(key, row);
-                LearnedBlockedEdges.append(learnedBlockedEdgesFile, row);
-                log.info("[Walker] Learned blocked edge {} -> {} ({}) — strike 1/{}: blocked this session, "
-                                + "enforced across sessions only after independent confirmation; {}",
-                        origin, destination, reason, LEARNED_EDGE_ENFORCE_STRIKES, learnedBlockedEdgesFile);
-            } else if (existing.strikes < LEARNED_EDGE_ENFORCE_STRIKES
-                    && now - existing.lastStrikeAtMs > LEARNED_EDGE_STRIKE_INDEPENDENCE_MS) {
-                LearnedBlockedEdges.Edge confirmed = existing.withStrikeAt(now);
-                int idx = learnedEdgeRows.indexOf(existing);
-                if (idx >= 0) {
-                    learnedEdgeRows.set(idx, confirmed);
-                }
-                learnedEdgeRowsByKey.put(key, confirmed);
-                LearnedBlockedEdges.save(learnedBlockedEdgesFile, learnedEdgeRows);
-                log.info("[Walker] Learned blocked edge {} -> {} ({}) — strike {}/{}: persistently enforced",
-                        origin, destination, reason, confirmed.strikes, LEARNED_EDGE_ENFORCE_STRIKES);
-            } else {
-                // Probation row re-observed within the independence window (e.g. a rapid client
-                // restart into the same stuck spot): session block stands, persistence unchanged.
-                log.debug("[Walker] Learned blocked edge {} -> {} re-observed within the independence "
-                        + "window; probation unchanged", origin, destination);
-            }
-        }
+        log.info("[Walker] Learned blocked edge {} -> {} ({}) — blocked for THIS SESSION only; "
+                + "permanent blocks belong in blocked_edges.tsv", origin, destination, reason);
         return true;
     }
 
-    /** Test seam: redirect the learned-edge store to a temp file and (re)load it. */
-    void setLearnedBlockedEdgesFileForTest(File file) {
-        this.learnedBlockedEdgesFile = file;
-        loadLearnedBlockedEdges();
+    /**
+     * Reverse of {@link #learnBlockedEdge}: removes the learned block so the edge is plannable again.
+     * Exists for condition-scoped blocks (a door that refused to open for game-state reasons) that the
+     * walker withdraws at the next walk session start. Static rows from blocked_edges.tsv are not
+     * touched — they were never in {@code learnedBlockedEdgeKeys}, and {@code blockedTransportEdgesPacked}
+     * only drops the key when it was a learned one.
+     */
+    public boolean unlearnBlockedEdge(WorldPoint origin, WorldPoint destination, String reason) {
+        if (origin == null || destination == null) {
+            return false;
+        }
+        long key = transportEdgeKey(
+                WorldPointUtil.packWorldPoint(origin),
+                WorldPointUtil.packWorldPoint(destination));
+        if (!learnedBlockedEdgeKeys.remove(key)) {
+            return false;
+        }
+        if (!STATIC_BLOCKED_EDGES_PACKED.contains(key)) {
+            blockedTransportEdgesPacked.remove(key);
+        }
+        log.info("[Walker] Unlearned blocked edge {} -> {} ({})", origin, destination, reason);
+        return true;
     }
 
     private void addBlockedEdge(WorldPoint origin, WorldPoint destination) {
@@ -1143,8 +1117,11 @@ public class PathfinderConfig {
         if (source == null || source.isEmpty()) {
             return;
         }
-        source.forEach((origin, set) ->
-                allTransports.put(origin, set == null ? Collections.emptySet() : new HashSet<>(set)));
+        source.forEach((origin, set) -> {
+            Set<Transport> valid = set == null ? new HashSet<>() : new HashSet<>(set);
+            valid.remove(null);
+            allTransports.put(origin, valid);
+        });
     }
 
     private void refreshRestrictionData() {
@@ -1290,7 +1267,7 @@ public class PathfinderConfig {
     private boolean useTransport(Transport transport) {
         // This runs once per expanded catalog edge during every refresh. Keep individual rejection
         // reasons at TRACE; DEBUG already receives the per-type aggregate emitted by refreshTransports.
-        if (!transportPlanningPolicy.isAdmitted(transport)) {
+        if (transport == null || !transportPlanningPolicy.isAdmitted(transport)) {
             log.trace("Transport ( O: {} D: {} type={} ) has no registered Microbot executor",
                     transport == null ? null : transport.getOrigin(),
                     transport == null ? null : transport.getDestination(),
@@ -1393,7 +1370,7 @@ public class PathfinderConfig {
      * (Leagues catalog / Area teleports): quest action patch, {@link #useTransport}, {@link Rs2LeaguesTransport#isTransportAllowed}.
      */
     public boolean isTransportUsableWithLeaguesContext(Transport transport, Rs2LeaguesTransport.LeaguesContext leaguesCtx) {
-        if (transport == null || leaguesCtx == null) {
+        if (client == null || transport == null || leaguesCtx == null) {
             return false;
         }
         updateActionBasedOnQuestState(transport);
@@ -2139,19 +2116,32 @@ public class PathfinderConfig {
         }
     }
 
+    // The cold-login key phase measured 658ms of an 833ms client-thread refresh (2026-08-13 19:40,
+    // reason=no_snapshot; warm refreshes read 1ms) — these name which read pays it. Written on every
+    // fingerprint, printed only on the slow log.
+    private volatile long lastKeyLeaguesMs;
+    private volatile long lastKeyInvMs;
+    private volatile long lastKeyEquipMs;
+    private volatile long lastKeyBankMs;
+
     private int fingerprintInventoryEquipmentBank() {
         final Set<Integer> ids = transportRelevantItemIds;
         final int[] h = {1};
+        long t = System.currentTimeMillis();
         Rs2Inventory.items().forEach(item -> {
             if (!itemAffectsTransportUsability(item.getId(), ids)) return;
             h[0] = 31 * h[0] + item.getId();
             h[0] = 31 * h[0] + item.getQuantity();
         });
+        lastKeyInvMs = System.currentTimeMillis() - t;
+        t = System.currentTimeMillis();
         Rs2Equipment.all().forEach(item -> {
             if (!itemAffectsTransportUsability(item.getId(), ids)) return;
             h[0] = 31 * h[0] + item.getId();
             h[0] = 31 * h[0] + item.getQuantity();
         });
+        lastKeyEquipMs = System.currentTimeMillis() - t;
+        t = System.currentTimeMillis();
         if (useBankItems) {
             Rs2Bank.getAll().forEach(item -> {
                 if (!itemAffectsTransportUsability(item.getId(), ids)) return;
@@ -2159,6 +2149,7 @@ public class PathfinderConfig {
                 h[0] = 31 * h[0] + item.getQuantity();
             });
         }
+        lastKeyBankMs = System.currentTimeMillis() - t;
         return h[0];
     }
 

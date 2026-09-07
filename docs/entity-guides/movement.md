@@ -295,3 +295,28 @@ Sticky interim targets should also clear when route-index progress goes stale. I
 When a route-following minimap click is outside the minimap clip, fallback clicks must stay on the raw path. A generic "reachable tile closer to target" fallback can select a tile far away from the route in open areas, especially near the final destination.
 
 For adjacent same-plane shortcuts, do not treat any movement away from the origin as success. Some shortcuts, such as stepping stones, can fail and place the player on a fallback tile; once the player is settled away from the expected destination, stop the landing wait and replan from the actual tile.
+
+## 14. Match transport execution to its interaction mechanism and interface family
+
+Transport rows do not all represent scene-object clicks, and related networks can use different widget groups. Before admitting new transport data, verify that the walker has an execution branch for the row's actual interaction and selects the interface from the origin object ID. Fail closed for unknown object IDs and tightly identify object-less item actions by their exact origin, destination, action, target, and item requirement.
+
+**Why this matters:** Barrows mound entries use a spade inventory action and therefore have object ID `0`; the generic object executor skips them. River Lum and River Dougne canoe stations open different map interfaces, so waiting unconditionally for the Lum map makes every Dougne route time out.
+
+**Pattern to follow:**
+
+```java
+if (isExactItemActionTransport(transport)) {
+    interactRequiredItem();
+    awaitDestination();
+    return finishHandledTransport(transport);
+}
+
+int mapComponent = mapComponentForOriginObject(transport.getObjectId());
+if (mapComponent < 0) {
+    return false;
+}
+```
+
+**Where this applies:** `Rs2Walker.handleTransports`, specialized transport handlers, and shortest-path transport resource additions.
+
+**Defensive check:** Add pure unit tests for exact item-action recognition and for every supported origin-object-to-interface mapping, plus a loader test proving required item and unlock fields survive TSV parsing.

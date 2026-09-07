@@ -168,7 +168,7 @@ public class LeagueModeState
 	public void setForTest(boolean seasonal, Set<LeagueRegion> unlocked)
 	{
 		this.seasonal = seasonal;
-		this.unlockedRegions = unlocked == null
+		this.unlockedRegions = unlocked == null || unlocked.isEmpty()
 			? EnumSet.noneOf(LeagueRegion.class)
 			: EnumSet.copyOf(unlocked);
 	}

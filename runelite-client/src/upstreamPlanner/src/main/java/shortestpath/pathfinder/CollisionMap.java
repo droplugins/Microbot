@@ -228,12 +228,12 @@ public class CollisionMap
 				{
 					if (transport.getOrigin() == Transport.UNDEFINED_ORIGIN
 						|| !(transport.isUsableAtWildernessLevel(wildernessLevel))
-						|| visited.get(transport.getOrigin(), pathBankVisited))
+						|| visited.get(neighborPacked, pathBankVisited))
 					{
 						continue;
 					}
-					neighbors.add(graph.createTile(transport.getOrigin(), node, pathBankVisited,
-						config.getAdditionalWalkingCost(transport.getOrigin())));
+					neighbors.add(graph.createTile(neighborPacked, node, pathBankVisited,
+						config.getAdditionalWalkingCost(neighborPacked)));
 				}
 			}
 		}

@@ -43,7 +43,7 @@ public class SkillRequirementParser implements FieldParser<int[]>
 				{
 					continue;
 				}
-				String[] levelAndSkill = requirement.split(DELIM_SPACE);
+				String[] levelAndSkill = requirement.split(DELIM_SPACE, 2);
 				if (levelAndSkill.length != 2)
 				{
 					log.error("Invalid level and skill: '{}'", requirement);
