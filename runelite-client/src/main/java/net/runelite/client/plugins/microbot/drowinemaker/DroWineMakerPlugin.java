@@ -17,7 +17,7 @@ import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
 
 @PluginDescriptor(
-        name = "Dro Wine Maker",
+        name = "[Dro] Wine Maker",
         description = "Automated wine maker using post-merge Rs2 utility framework with comprehensive randomization.",
         tags = {"wine", "cooking", "microbot", "antiban", "dro"},
         enabledByDefault = true
