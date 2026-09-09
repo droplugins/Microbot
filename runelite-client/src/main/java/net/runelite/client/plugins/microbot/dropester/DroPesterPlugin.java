@@ -2,14 +2,15 @@ package net.runelite.client.plugins.microbot.dropester;
 
 import com.google.inject.Provides;
 import lombok.extern.slf4j.Slf4j;
-import net.runelite.api.NPC;
 import net.runelite.api.ObjectID;
 import net.runelite.api.Skill;
 import net.runelite.api.coords.WorldPoint;
+import net.runelite.api.events.ChatMessage;
 import net.runelite.api.widgets.ComponentID;
 import net.runelite.api.widgets.Widget;
 import net.runelite.api.widgets.WidgetInfo;
 import net.runelite.client.config.*;
+import net.runelite.client.eventbus.Subscribe;
 import net.runelite.client.plugins.Plugin;
 import net.runelite.client.plugins.PluginDescriptor;
 import net.runelite.client.plugins.microbot.Microbot;
@@ -30,6 +31,8 @@ import net.runelite.client.ui.overlay.components.TitleComponent;
 
 import javax.inject.Inject;
 import java.awt.*;
+import java.util.List;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.TimeUnit;
 
 @PluginDescriptor(
@@ -37,11 +40,12 @@ import java.util.concurrent.TimeUnit;
         description = "Attacks monsters in Pest Control with human-like anti-pattern behaviors.",
         tags = {"pest control", "minigames", "dropester"},
         authors = {"Droplugins", "Mocrosoft"},
-        version = "1.0.0",
+        version = "1.1",
+        minClientVersion = "2.6.22",
         enabledByDefault = false
 )
 @Slf4j
-public class DroPester extends Plugin {
+public class DroPesterPlugin extends Plugin {
 
     @Inject
     private DroPesterScript script;
@@ -73,6 +77,15 @@ public class DroPester extends Plugin {
         script.shutdown();
         if (overlayManager != null) {
             overlayManager.remove(overlay);
+        }
+    }
+
+    @Subscribe
+    public void onChatMessage(ChatMessage event) {
+        if (event.getMessage().toLowerCase().contains("i can't reach that")) {
+            if (script != null) {
+                script.onUnreachableMessage();
+            }
         }
     }
 
@@ -139,6 +152,19 @@ public class DroPester extends Plugin {
         private long prayerDelay = 0;
         private boolean drunkPotionThisGame = false;
         private boolean toggledPrayerThisGame = false;
+
+        // Thread-safe list to store blacklisted NPCs that threw "I can't reach that"
+        private final List<Integer> unreachableNpcs = new CopyOnWriteArrayList<>();
+        private volatile Rs2NpcModel currentTarget = null;
+        private volatile boolean unreachableTriggered = false;
+
+        public void onUnreachableMessage() {
+            unreachableTriggered = true;
+            if (currentTarget != null && currentTarget.getNpc() != null) {
+                unreachableNpcs.add(currentTarget.getNpc().getIndex());
+                Microbot.log("Target unreachable (" + currentTarget.getName() + ") - treating as defeated.");
+            }
+        }
 
         private static WorldPoint stepTowards(WorldPoint from, WorldPoint to, int maxStep) {
             int dx = to.getX() - from.getX();
@@ -248,13 +274,22 @@ public class DroPester extends Plugin {
                             && n.getName().toLowerCase().contains("shifter")
                             && n.getNpc() != null
                             && !n.getNpc().isDead()
-                            && n.getNpc().getHealthRatio() != 0)
+                            && n.getNpc().getHealthRatio() != 0
+                            && !unreachableNpcs.contains(n.getNpc().getIndex()))
                     .nearestOnClientThread();
 
             if (shifterTarget != null) {
+                currentTarget = shifterTarget;
+                unreachableTriggered = false;
                 Microbot.log("Actively attacking nearby Shifter...");
                 shifterTarget.click("Attack");
-                sleepUntil(() -> !Microbot.getClient().getLocalPlayer().isInteracting(), 4000);
+
+                // Sleep until we are interacting, OR we get an unreachable chat message
+                sleepUntil(() -> !Microbot.getClient().getLocalPlayer().isInteracting() || unreachableTriggered, 4000);
+
+                if (unreachableTriggered) {
+                    sleep(200, 400); // small delay to mimic human reaction to "I can't reach that"
+                }
                 return;
             }
 
@@ -265,13 +300,22 @@ public class DroPester extends Plugin {
                             && n.getNpc() != null
                             && n.getNpc().getCombatLevel() > 0
                             && !n.getNpc().isDead()
-                            && n.getNpc().getHealthRatio() != 0)
+                            && n.getNpc().getHealthRatio() != 0
+                            && !unreachableNpcs.contains(n.getNpc().getIndex()))
                     .nearestOnClientThread();
 
             if (backupTarget != null) {
+                currentTarget = backupTarget;
+                unreachableTriggered = false;
                 Microbot.log("Actively attacking nearby Pest monster...");
                 backupTarget.click("Attack");
-                sleepUntil(() -> !Microbot.getClient().getLocalPlayer().isInteracting(), 4000);
+
+                // Sleep until we are interacting, OR we get an unreachable chat message
+                sleepUntil(() -> !Microbot.getClient().getLocalPlayer().isInteracting() || unreachableTriggered, 4000);
+
+                if (unreachableTriggered) {
+                    sleep(200, 400); // small delay to mimic human reaction to "I can't reach that"
+                }
             }
         }
 
@@ -281,6 +325,8 @@ public class DroPester extends Plugin {
                 walkToCenter = false;
                 drunkPotionThisGame = false;
                 toggledPrayerThisGame = false;
+                unreachableNpcs.clear();
+                currentTarget = null;
                 Rs2Walker.setTarget(null);
             }
 
@@ -325,7 +371,7 @@ public class DroPester extends Plugin {
     // =========================================================================
     public static class DroPesterOverlay extends OverlayPanel {
         @Inject
-        DroPesterOverlay(DroPester plugin) {
+        DroPesterOverlay(DroPesterPlugin plugin) {
             super(plugin);
             setPosition(OverlayPosition.TOP_LEFT);
         }
@@ -335,7 +381,7 @@ public class DroPester extends Plugin {
             try {
                 panelComponent.setPreferredSize(new Dimension(220, 100));
                 panelComponent.getChildren().add(TitleComponent.builder()
-                        .text("DroPester v1.0.0")
+                        .text("DroPester v1.1")
                         .color(Color.GREEN)
                         .build());
 
