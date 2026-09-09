@@ -16,6 +16,11 @@ import net.runelite.client.plugins.PluginDescriptor;
 import net.runelite.client.plugins.microbot.Microbot;
 import net.runelite.client.plugins.microbot.Script;
 import net.runelite.client.plugins.microbot.api.npc.models.Rs2NpcModel;
+import net.runelite.client.plugins.microbot.util.antiban.Rs2Antiban;
+import net.runelite.client.plugins.microbot.util.antiban.Rs2AntibanSettings;
+import net.runelite.client.plugins.microbot.util.antiban.enums.Activity;
+import net.runelite.client.plugins.microbot.util.antiban.enums.ActivityIntensity;
+import net.runelite.client.plugins.microbot.util.antiban.enums.PlayStyle;
 import net.runelite.client.plugins.microbot.util.inventory.Rs2Inventory;
 import net.runelite.client.plugins.microbot.util.inventory.Rs2ItemModel;
 import net.runelite.client.plugins.microbot.util.math.Rs2Random;
@@ -40,7 +45,7 @@ import java.util.concurrent.TimeUnit;
         description = "Attacks monsters in Pest Control with human-like anti-pattern behaviors.",
         tags = {"pest control", "minigames", "dropester"},
         authors = {"Droplugins", "Mocrosoft"},
-        version = "1.1",
+        version = "1.2",
         minClientVersion = "2.6.22",
         enabledByDefault = false
 )
@@ -152,6 +157,7 @@ public class DroPesterPlugin extends Plugin {
         private long prayerDelay = 0;
         private boolean drunkPotionThisGame = false;
         private boolean toggledPrayerThisGame = false;
+        private long outsideStartTime = 0;
 
         // Thread-safe list to store blacklisted NPCs that threw "I can't reach that"
         private final List<Integer> unreachableNpcs = new CopyOnWriteArrayList<>();
@@ -184,9 +190,25 @@ public class DroPesterPlugin extends Plugin {
         public boolean run(DroPesterConfig config) {
             this.config = config;
 
+            Rs2Antiban.resetAntibanSettings();
+            Rs2Antiban.setActivity(Activity.GENERAL_COMBAT);
+            Rs2Antiban.setActivityIntensity(ActivityIntensity.LOW);
+            Rs2Antiban.setPlayStyle(PlayStyle.MODERATE);
+            Rs2Antiban.activateAntiban();
+            Rs2AntibanSettings.moveMouseOffScreen = true;
+            Rs2AntibanSettings.simulateMistakes = true;
+            Rs2AntibanSettings.naturalMouse = true;
+            Rs2AntibanSettings.usePlayStyle = true;
+            Rs2AntibanSettings.behavioralVariability = true;
+            Rs2AntibanSettings.nonLinearIntervals = true;
+            Rs2AntibanSettings.actionCooldownChance = 0.01;
+            Rs2AntibanSettings.moveMouseOffScreenChance = 0.95;
+
             mainScheduledFuture = scheduledExecutorService.scheduleWithFixedDelay(() -> {
                 try {
                     if (!Microbot.isLoggedIn() || !super.run()) return;
+
+                    if (Rs2AntibanSettings.actionCooldownActive) return;
 
                     final boolean isInPC = isInPestControl();
                     final boolean isInBoat = isInBoat();
@@ -205,6 +227,13 @@ public class DroPesterPlugin extends Plugin {
             return true;
         }
 
+        @Override
+        public void shutdown() {
+            super.shutdown();
+            Rs2Antiban.deactivateAntiban();
+            Rs2Antiban.resetAntibanSettings();
+        }
+
         private void handleInGameLogic() {
             if (!wasInGame) {
                 wasInGame = true;
@@ -212,6 +241,7 @@ public class DroPesterPlugin extends Plugin {
                 gameStartTime = System.currentTimeMillis();
                 drunkPotionThisGame = false;
                 toggledPrayerThisGame = false;
+                outsideStartTime = 0;
 
                 potionDelay = Rs2Random.between(1000, 27000);
                 prayerDelay = Rs2Random.between(1000, 27000);
@@ -284,11 +314,10 @@ public class DroPesterPlugin extends Plugin {
                 Microbot.log("Actively attacking nearby Shifter...");
                 shifterTarget.click("Attack");
 
-                // Sleep until we are interacting, OR we get an unreachable chat message
                 sleepUntil(() -> !Microbot.getClient().getLocalPlayer().isInteracting() || unreachableTriggered, 4000);
 
                 if (unreachableTriggered) {
-                    sleep(200, 400); // small delay to mimic human reaction to "I can't reach that"
+                    sleep(200, 400);
                 }
                 return;
             }
@@ -310,11 +339,10 @@ public class DroPesterPlugin extends Plugin {
                 Microbot.log("Actively attacking nearby Pest monster...");
                 backupTarget.click("Attack");
 
-                // Sleep until we are interacting, OR we get an unreachable chat message
                 sleepUntil(() -> !Microbot.getClient().getLocalPlayer().isInteracting() || unreachableTriggered, 4000);
 
                 if (unreachableTriggered) {
-                    sleep(200, 400); // small delay to mimic human reaction to "I can't reach that"
+                    sleep(200, 400);
                 }
             }
         }
@@ -327,18 +355,33 @@ public class DroPesterPlugin extends Plugin {
                 toggledPrayerThisGame = false;
                 unreachableNpcs.clear();
                 currentTarget = null;
+                outsideStartTime = 0;
                 Rs2Walker.setTarget(null);
             }
 
-            if (!isInBoat && Rs2Player.getWorld() != config.world()) {
-                Microbot.hopToWorld(config.world());
-                sleepUntil(() -> Rs2Player.getWorld() == config.world(), 5000);
-                return;
-            }
-
             if (!isInBoat) {
+                if (outsideStartTime == 0) {
+                    outsideStartTime = System.currentTimeMillis();
+                } else if (System.currentTimeMillis() - outsideStartTime > 210000) { // 3.5 minutes timeout watchdog
+                    Microbot.log("Stuck outside/boat for > 3.5 minutes. Resetting position check & world hop...");
+                    outsideStartTime = System.currentTimeMillis();
+                    if (Rs2Player.getWorld() != config.world()) {
+                        Microbot.hopToWorld(config.world());
+                        sleepUntil(() -> Rs2Player.getWorld() == config.world(), 5000);
+                    }
+                }
+
+                if (Rs2Player.getWorld() != config.world()) {
+                    Microbot.hopToWorld(config.world());
+                    sleepUntil(() -> Rs2Player.getWorld() == config.world(), 5000);
+                    return;
+                }
+
                 clickGangplank();
-                sleepUntil(this::isInBoat, 3000);
+                sleepUntil(this::isInBoat, 4000);
+            } else {
+                // Reset timeout timer when successfully waiting inside the boat
+                outsideStartTime = 0;
             }
         }
 
@@ -381,7 +424,7 @@ public class DroPesterPlugin extends Plugin {
             try {
                 panelComponent.setPreferredSize(new Dimension(220, 100));
                 panelComponent.getChildren().add(TitleComponent.builder()
-                        .text("DroPester v1.1")
+                        .text("DroPester v1.2")
                         .color(Color.GREEN)
                         .build());
 

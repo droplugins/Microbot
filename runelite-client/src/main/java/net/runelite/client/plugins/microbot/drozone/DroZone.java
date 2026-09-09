@@ -33,6 +33,7 @@ import net.runelite.client.plugins.microbot.util.antiban.enums.Activity;
 import net.runelite.client.plugins.microbot.util.antiban.enums.ActivityIntensity;
 import net.runelite.client.plugins.microbot.util.antiban.enums.PlayStyle;
 import net.runelite.client.plugins.microbot.util.bank.Rs2Bank;
+import net.runelite.client.plugins.microbot.util.camera.Rs2Camera;
 import net.runelite.client.plugins.microbot.util.combat.Rs2Combat;
 import net.runelite.client.plugins.microbot.util.inventory.Rs2Inventory;
 import net.runelite.client.plugins.microbot.util.keyboard.Rs2Keyboard;
@@ -157,6 +158,7 @@ public class DroZone extends Plugin {
         private long lastOverloadTime = 0;
         private static final long OVERLOAD_COOLDOWN_MS = 15000;
         private boolean initialSetupDone = false;
+        private long dreamEntryTime = 0;
 
         @Inject
         private Rs2TileObjectCache tileObjectCache;
@@ -167,7 +169,6 @@ public class DroZone extends Plugin {
             return Rs2Inventory.count("Overload (4)") >= config.overloadPotionAmount();
         }
 
-        // Helper methods for robust potion handling
         public boolean hasPotion(String name) {
             for (int i = 1; i <= 4; i++) {
                 if (Rs2Inventory.hasItem(name + " (" + i + ")")) return true;
@@ -179,6 +180,8 @@ public class DroZone extends Plugin {
             for (int i = 1; i <= 4; i++) {
                 String potName = name + " (" + i + ")";
                 if (Rs2Inventory.hasItem(potName)) {
+                    int delay = Rs2Random.between(200, 600);
+                    Global.sleep(delay);
                     Rs2Inventory.interact(potName, "Drink");
                     return;
                 }
@@ -189,8 +192,11 @@ public class DroZone extends Plugin {
             this.config = config;
             this.plugin = plugin;
             initialSetupDone = false;
+            dreamEntryTime = 0;
 
             Microbot.getSpecialAttackConfigs().setSpecialAttack(true);
+
+            // Native antiban initialization with drastically reduced action cooldown chance (1%)
             Rs2Antiban.resetAntibanSettings();
             Rs2Antiban.setActivity(Activity.GENERAL_COMBAT);
             Rs2Antiban.setActivityIntensity(ActivityIntensity.LOW);
@@ -202,20 +208,54 @@ public class DroZone extends Plugin {
             Rs2AntibanSettings.usePlayStyle = true;
             Rs2AntibanSettings.behavioralVariability = true;
             Rs2AntibanSettings.nonLinearIntervals = true;
-            Rs2AntibanSettings.actionCooldownChance = 0.05;
+            Rs2AntibanSettings.actionCooldownChance = 0.01;
             Rs2AntibanSettings.moveMouseOffScreenChance = 0.95;
+
+            // Delayed randomized gradual zoom setup on startup: executes once after a randomized 1-7 second delay
+            Microbot.getClientThread().runOnSeperateThread(() -> {
+                Global.sleep(Rs2Random.between(1000, 7000));
+
+                int currentZoom = Rs2Camera.getZoom();
+                int targetZoom = Rs2Random.between(250, 450);
+                int stepDirection = targetZoom > currentZoom ? 1 : -1;
+
+                while (Math.abs(currentZoom - targetZoom) > 5) {
+                    int step = Rs2Random.between(5, 25);
+                    currentZoom += step * stepDirection;
+                    if ((stepDirection > 0 && currentZoom > targetZoom) || (stepDirection < 0 && currentZoom < targetZoom)) {
+                        currentZoom = targetZoom;
+                    }
+                    Rs2Camera.setZoom(currentZoom);
+                    Global.sleep(Rs2Random.between(40, 120));
+                }
+
+                Rs2Camera.setPitch(Rs2Random.between(3000, 3064));
+                Global.sleep(Rs2Random.between(150, 400));
+                Rs2Camera.setYaw(Rs2Random.between(0, 16383));
+
+                return true;
+            });
 
             mainScheduledFuture = scheduledExecutorService.scheduleWithFixedDelay(() -> {
                 try {
                     if (!Microbot.isLoggedIn()) return;
-                    if (Rs2AntibanSettings.actionCooldownActive) return;
+
+                    boolean withinDreamGracePeriod = !isOutside() && (!initialSetupDone || (System.currentTimeMillis() - dreamEntryTime < 120000));
+
+                    if (!withinDreamGracePeriod) {
+                        if (Rs2AntibanSettings.actionCooldownActive) return;
+                    }
 
                     if (isOutside()) {
                         lastOverloadTime = 0;
                         initialSetupDone = false;
+                        dreamEntryTime = 0;
                         Rs2Walker.setTarget(null);
                         handleOutsideNmz();
                     } else {
+                        if (dreamEntryTime == 0) {
+                            dreamEntryTime = System.currentTimeMillis();
+                        }
                         handleInsideNmz();
                     }
                 } catch (Exception ex) {
@@ -232,6 +272,7 @@ public class DroZone extends Plugin {
             Rs2Antiban.resetAntibanSettings();
             lastOverloadTime = 0;
             initialSetupDone = false;
+            dreamEntryTime = 0;
         }
 
         public boolean isOutside() {
@@ -267,16 +308,18 @@ public class DroZone extends Plugin {
         public void handleInsideNmz() {
             if (!isInDream()) return;
 
-            // Check if auto retaliate is turned off (Varbit 464: 0 = on, 1 = off)
             boolean autoRetaliateOff = Microbot.getVarbitValue(464) == 1;
 
             if (autoRetaliateOff) {
+                Global.sleep(Rs2Random.between(200, 600));
                 Rs2Combat.setAutoRetaliate(true);
                 Global.sleep(400, 800);
                 return;
             }
 
-            Rs2Antiban.takeMicroBreakByChance();
+            if (initialSetupDone && System.currentTimeMillis() - dreamEntryTime >= 120000) {
+                Rs2Antiban.takeMicroBreakByChance();
+            }
 
             if (config.walkToCenter()) {
                 walkToCenter();
@@ -286,26 +329,21 @@ public class DroZone extends Plugin {
                 int currentHP = Microbot.getClient().getBoostedSkillLevel(Skill.HITPOINTS);
                 int currentAbsorption = Microbot.getVarbitValue(VarbitID.NZONE_ABSORB_POTION_EFFECTS);
 
-                // 1. Drink absorptions up to 900 (prevents endless loop if hit by a monster while setting up)
                 if (currentAbsorption < 900 && hasPotion("Absorption")) {
                     drinkPotion("Absorption");
-                    Rs2Antiban.actionCooldown();
                     Global.sleep(800, 1400);
                     return;
                 }
 
-                // 2. Drink one overload first while HP is high
                 boolean overloadBoostActive = Microbot.getClient().getBoostedSkillLevel(Skill.STRENGTH) > Microbot.getClient().getRealSkillLevel(Skill.STRENGTH);
 
                 if (!overloadBoostActive && hasPotion("Overload")) {
                     drinkPotion("Overload");
                     lastOverloadTime = System.currentTimeMillis();
-                    Rs2Antiban.actionCooldown();
                     Global.sleep(1200, 2000);
                     return;
                 }
 
-                // 3. Rock cake down to 1 HP
                 if (currentHP > 1) {
                     guzzleOrFeel();
                     Global.sleep(600, 1000);
@@ -320,8 +358,13 @@ public class DroZone extends Plugin {
 
                 if (!Rs2Player.isInCombat()) {
                     Rs2NpcModel closestNpc = npcCache.query().nearest();
-                    if (closestNpc != null && closestNpc.click("Attack")) {
-                        Rs2Antiban.actionCooldown();
+                    if (closestNpc != null) {
+                        Global.sleep(Rs2Random.between(600, 900));
+                        if (closestNpc.click("Attack")) {
+                            int tickDelay = Rs2Random.between(1, 3);
+                            Global.sleep(tickDelay * 600);
+                            Rs2Antiban.actionCooldown();
+                        }
                     }
                 }
             }
@@ -335,28 +378,48 @@ public class DroZone extends Plugin {
         }
 
         private void guzzleOrFeel() {
+            int delay = Rs2Random.between(200, 600);
+            Global.sleep(delay);
             if (Rs2Inventory.hasItem("Locator orb")) {
                 Rs2Inventory.interact("Locator orb", "Feel");
-                Rs2Antiban.actionCooldown();
+                if (initialSetupDone && System.currentTimeMillis() - dreamEntryTime >= 120000) {
+                    int tickDelay = Rs2Random.between(1, 3);
+                    Global.sleep(tickDelay * 600);
+                    Rs2Antiban.actionCooldown();
+                }
             } else if (Rs2Inventory.hasItem("Dwarven rock cake")) {
                 Rs2Inventory.interact("Dwarven rock cake", "Guzzle");
-                Rs2Antiban.actionCooldown();
+                if (initialSetupDone && System.currentTimeMillis() - dreamEntryTime >= 120000) {
+                    int tickDelay = Rs2Random.between(1, 3);
+                    Global.sleep(tickDelay * 600);
+                    Rs2Antiban.actionCooldown();
+                }
             } else if (Rs2Inventory.hasItem("Rock cake")) {
                 Rs2Inventory.interact("Rock cake", "Guzzle");
-                Rs2Antiban.actionCooldown();
+                if (initialSetupDone && System.currentTimeMillis() - dreamEntryTime >= 120000) {
+                    int tickDelay = Rs2Random.between(1, 3);
+                    Global.sleep(tickDelay * 600);
+                    Rs2Antiban.actionCooldown();
+                }
             }
         }
 
         public void startNmzDream() {
             center = new WorldPoint(Rs2Random.between(2270, 2276), Rs2Random.between(4693, 4696), 0);
             Rs2NpcModel dominic = npcCache.query().withName("Dominic Onion").nearestOnClientThread();
-            if (dominic != null) dominic.click("Dream");
+            if (dominic != null) {
+                Global.sleep(Rs2Random.between(600, 900));
+                dominic.click("Dream");
+            }
             Global.sleepUntil(() -> Rs2Widget.hasWidget("Which dream would you like to experience?"), 5000);
+            Global.sleep(Rs2Random.between(200, 600));
             Rs2Widget.clickWidget("Previous:");
             Global.sleepUntil(() -> Rs2Widget.hasWidget("Click here to continue"), 5000);
+            Global.sleep(Rs2Random.between(200, 600));
             Rs2Widget.clickWidget("Click here to continue");
             Global.sleepUntil(() -> Rs2Widget.hasWidget("Agree to pay"), 5000);
             if (Rs2Widget.hasWidget("Agree to pay")) {
+                Global.sleep(Rs2Random.between(200, 600));
                 Rs2Keyboard.typeString("1");
                 Rs2Keyboard.enter();
             }
@@ -368,12 +431,12 @@ public class DroZone extends Plugin {
             int count2 = Rs2Inventory.count(baseName + " (2)");
             int count1 = Rs2Inventory.count(baseName + " (1)");
 
-            // Only skip depositing if we have exactly a perfectly clean inventory of required doses
             if (count4 == requiredAmount && count3 == 0 && count2 == 0 && count1 == 0) return;
-            if (count4 == 0 && count3 == 0 && count2 == 0 && count1 == 0) return; // None to deposit
+            if (count4 == 0 && count3 == 0 && count2 == 0 && count1 == 0) return;
 
             Rs2TileObjectModel obj = tileObjectCache.query().withId(objectId).nearest();
             if (obj == null) return;
+            Global.sleep(Rs2Random.between(200, 600));
             obj.click("Store");
             Global.sleepUntil(() -> Rs2Widget.hasWidget("Store all your "), 5000);
             if (Rs2Widget.hasWidget("Store all your ")) {
@@ -390,6 +453,7 @@ public class DroZone extends Plugin {
 
             Rs2TileObjectModel obj = tileObjectCache.query().withId(objectId).nearest();
             if (obj == null) return;
+            Global.sleep(Rs2Random.between(200, 600));
             obj.click("Take");
             Global.sleepUntil(() -> Rs2Widget.hasWidget("How many doses of "), 5000);
 
@@ -412,7 +476,11 @@ public class DroZone extends Plugin {
             if (!overloadBoostActive && currentHP >= 51 && hasPotion("Overload")) {
                 drinkPotion("Overload");
                 lastOverloadTime = System.currentTimeMillis();
-                Rs2Antiban.actionCooldown();
+                if (System.currentTimeMillis() - dreamEntryTime >= 120000) {
+                    int tickDelay = Rs2Random.between(1, 3);
+                    Global.sleep(tickDelay * 600);
+                    Rs2Antiban.actionCooldown();
+                }
                 Global.sleep(1200, 2000);
             }
         }
@@ -440,7 +508,11 @@ public class DroZone extends Plugin {
                 int drinks = Rs2Random.between(2, 4);
                 for (int i = 0; i < drinks; i++) {
                     drinkPotion("Absorption");
-                    Rs2Antiban.actionCooldown();
+                    if (System.currentTimeMillis() - dreamEntryTime >= 120000) {
+                        int tickDelay = Rs2Random.between(1, 3);
+                        Global.sleep(tickDelay * 600);
+                        Rs2Antiban.actionCooldown();
+                    }
                     Global.sleep(Rs2Random.between(800, 1400));
                 }
                 minAbsorption = Rs2Random.between(100, 300);
@@ -452,13 +524,18 @@ public class DroZone extends Plugin {
                             Rs2Widget.getWidget(129, 6) == null || Rs2Widget.getWidget(129, 6).isHidden())
                     .orElse(false)) {
                 Rs2TileObjectModel vial = tileObjectCache.query().withId(ObjectID.NZONE_LOBBY_VIAL).nearest();
-                if (vial != null) vial.click("drink");
+                if (vial != null) {
+                    Global.sleep(Rs2Random.between(200, 600));
+                    vial.click("drink");
+                }
             }
             Global.sleep(2000, 4000);
             Widget widget = Rs2Widget.getWidget(129, 6);
             if (!Microbot.getClientThread().runOnClientThreadOptional(widget::isHidden).orElse(false)) {
+                Global.sleep(Rs2Random.between(200, 600));
                 Rs2Widget.clickWidget(widget.getId());
                 Global.sleep(300);
+                Global.sleep(Rs2Random.between(200, 600));
                 Rs2Widget.clickWidget(widget.getId());
             }
             Global.sleep(2000, 4000);
@@ -469,13 +546,21 @@ public class DroZone extends Plugin {
             int overloadAmt = Microbot.getVarbitValue(VarbitID.NZONE_POTION_3);
             int absorptionAmt = Microbot.getVarbitValue(VarbitID.NZONE_POTION_4);
 
-            int overloadDosesNeeded = Math.max(0, config.overloadPotionAmount() * 4 - overloadAmt);
-            int absorptionDosesNeeded = Math.max(0, config.absorptionPotionAmount() * 4 - absorptionAmt);
+            int requiredOverloadDoses = config.overloadPotionAmount() * 4;
+            int requiredAbsorptionDoses = config.absorptionPotionAmount() * 4;
+
+            int overloadDosesNeeded = Math.max(0, requiredOverloadDoses - overloadAmt);
+            int absorptionDosesNeeded = Math.max(0, requiredAbsorptionDoses - absorptionAmt);
 
             if (overloadDosesNeeded == 0 && absorptionDosesNeeded == 0) return;
 
-            int overloadToBuy = (overloadDosesNeeded + 3) / 4;
-            int absorptionToBuy = (absorptionDosesNeeded + 3) / 4;
+            int overloadToBuy = Math.min((overloadDosesNeeded + 3) / 4, 255);
+            int absorptionToBuy = Math.min((absorptionDosesNeeded + 3) / 4, 255);
+
+            if (overloadAmt >= requiredOverloadDoses || overloadAmt >= 255) overloadToBuy = 0;
+            if (absorptionAmt >= requiredAbsorptionDoses || absorptionAmt >= 255) absorptionToBuy = 0;
+
+            if (overloadToBuy == 0 && absorptionToBuy == 0) return;
 
             int totalCost = overloadToBuy * 1500 + absorptionToBuy * 1000;
             int nmzPoints = Microbot.getVarbitPlayerValue(VarPlayerID.NZONE_REWARDPOINTS);
@@ -488,6 +573,7 @@ public class DroZone extends Plugin {
 
             Rs2TileObjectModel chest = tileObjectCache.query().withId(ObjectID.NZONE_LOBBY_CHEST).nearest();
             if (chest == null) return;
+            Global.sleep(Rs2Random.between(200, 600));
             chest.click();
             Global.sleepUntil(() -> Rs2Widget.isWidgetVisible(13500418) || Rs2Bank.isBankPinWidgetVisible(), 10000);
             if (Rs2Bank.isBankPinWidgetVisible()) {
@@ -502,6 +588,7 @@ public class DroZone extends Plugin {
             Widget benefitsBtn = Rs2Widget.getWidget(13500418);
             if (benefitsBtn == null) return;
             if (benefitsBtn.getSpriteId() != 813) {
+                Global.sleep(Rs2Random.between(200, 600));
                 Rs2Widget.clickWidgetFast(benefitsBtn, 4, 4);
                 Global.sleepUntil(() -> {
                     Widget btn = Rs2Widget.getWidget(13500418);
@@ -510,15 +597,21 @@ public class DroZone extends Plugin {
             }
 
             for (int i = 0; i < overloadToBuy; i++) {
+                if (Microbot.getVarbitValue(VarbitID.NZONE_POTION_3) >= requiredOverloadDoses ||
+                        Microbot.getVarbitValue(VarbitID.NZONE_POTION_3) >= 255) break;
                 Widget nmzRewardShop = Rs2Widget.getWidget(206, 6);
                 if (nmzRewardShop == null) break;
+                Global.sleep(Rs2Random.between(200, 600));
                 Rs2Widget.clickWidgetFast(nmzRewardShop.getChild(6), 6, 4);
                 Global.sleep(600, 1000);
             }
 
             for (int i = 0; i < absorptionToBuy; i++) {
+                if (Microbot.getVarbitValue(VarbitID.NZONE_POTION_4) >= requiredAbsorptionDoses ||
+                        Microbot.getVarbitValue(VarbitID.NZONE_POTION_4) >= 255) break;
                 Widget nmzRewardShop = Rs2Widget.getWidget(206, 6);
                 if (nmzRewardShop == null) break;
+                Global.sleep(Rs2Random.between(200, 600));
                 Rs2Widget.clickWidgetFast(nmzRewardShop.getChild(9), 9, 4);
                 Global.sleep(600, 1000);
             }
