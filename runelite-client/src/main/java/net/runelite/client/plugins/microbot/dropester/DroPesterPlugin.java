@@ -45,7 +45,7 @@ import java.util.concurrent.TimeUnit;
         description = "Attacks monsters in Pest Control with human-like anti-pattern behaviors.",
         tags = {"pest control", "minigames", "dropester"},
         authors = {"Droplugins", "Mocrosoft"},
-        version = "1.2",
+        version = "1.3",
         minClientVersion = "2.6.22",
         enabledByDefault = false
 )
@@ -152,6 +152,7 @@ public class DroPesterPlugin extends Plugin {
 
         private boolean wasInGame = false;
         private boolean walkToCenter = false;
+        private int walkAttempts = 0;
         private long gameStartTime = 0;
         private long potionDelay = 0;
         private long prayerDelay = 0;
@@ -238,6 +239,7 @@ public class DroPesterPlugin extends Plugin {
             if (!wasInGame) {
                 wasInGame = true;
                 walkToCenter = false;
+                walkAttempts = 0;
                 gameStartTime = System.currentTimeMillis();
                 drunkPotionThisGame = false;
                 toggledPrayerThisGame = false;
@@ -255,10 +257,25 @@ public class DroPesterPlugin extends Plugin {
                 WorldPoint worldPoint = WorldPoint.fromRegion(playerLoc.getRegionID(), 32, 17, playerLoc.getPlane());
                 if (playerLoc.distanceTo(worldPoint) <= 4) {
                     walkToCenter = true;
+                    walkAttempts = 0;
                 } else {
                     Microbot.log("Running to center platform near Void Knight...");
                     Rs2Walker.walkMiniMap(stepTowards(playerLoc, worldPoint, 14));
-                    sleepUntil(() -> !Rs2Player.isMoving(), 4000);
+
+                    // Failsafe: check if minimap click successfully triggered movement
+                    boolean startedMoving = sleepUntil(Rs2Player::isMoving, 800);
+                    if (!startedMoving) {
+                        walkAttempts++;
+                        Microbot.log("Walk attempt failed to trigger movement (" + walkAttempts + "/6).");
+                        if (walkAttempts >= 6) {
+                            Microbot.log("Failsafe triggered: Gates appear blocked. Bypassing walk to center and starting local combat.");
+                            walkToCenter = true;
+                            walkAttempts = 0;
+                        }
+                    } else {
+                        sleepUntil(() -> !Rs2Player.isMoving(), 4000);
+                        walkAttempts = 0;
+                    }
                     return;
                 }
             }
@@ -294,7 +311,7 @@ public class DroPesterPlugin extends Plugin {
                 }
             }
 
-            if (Microbot.getClient().getLocalPlayer().isInteracting()) {
+            if (Rs2Player.isInteracting()) {
                 return;
             }
 
@@ -314,7 +331,7 @@ public class DroPesterPlugin extends Plugin {
                 Microbot.log("Actively attacking nearby Shifter...");
                 shifterTarget.click("Attack");
 
-                sleepUntil(() -> !Microbot.getClient().getLocalPlayer().isInteracting() || unreachableTriggered, 4000);
+                sleepUntil(() -> !Rs2Player.isInteracting() || unreachableTriggered, 4000);
 
                 if (unreachableTriggered) {
                     sleep(200, 400);
@@ -339,7 +356,7 @@ public class DroPesterPlugin extends Plugin {
                 Microbot.log("Actively attacking nearby Pest monster...");
                 backupTarget.click("Attack");
 
-                sleepUntil(() -> !Microbot.getClient().getLocalPlayer().isInteracting() || unreachableTriggered, 4000);
+                sleepUntil(() -> !Rs2Player.isInteracting() || unreachableTriggered, 4000);
 
                 if (unreachableTriggered) {
                     sleep(200, 400);
@@ -351,6 +368,7 @@ public class DroPesterPlugin extends Plugin {
             if (wasInGame) {
                 wasInGame = false;
                 walkToCenter = false;
+                walkAttempts = 0;
                 drunkPotionThisGame = false;
                 toggledPrayerThisGame = false;
                 unreachableNpcs.clear();
@@ -386,7 +404,7 @@ public class DroPesterPlugin extends Plugin {
         }
 
         private void clickGangplank() {
-            int cbLevel = Microbot.getClient().getLocalPlayer().getCombatLevel();
+            int cbLevel = Rs2Player.getLocalPlayer() != null ? Rs2Player.getLocalPlayer().getCombatLevel() : 40;
             int gangplankId = ObjectID.GANGPLANK_14315; // Novice
             if (cbLevel >= 100) {
                 gangplankId = ObjectID.GANGPLANK_25632; // Veteran
@@ -424,7 +442,7 @@ public class DroPesterPlugin extends Plugin {
             try {
                 panelComponent.setPreferredSize(new Dimension(220, 100));
                 panelComponent.getChildren().add(TitleComponent.builder()
-                        .text("DroPester v1.2")
+                        .text("DroPester v1.3")
                         .color(Color.GREEN)
                         .build());
 

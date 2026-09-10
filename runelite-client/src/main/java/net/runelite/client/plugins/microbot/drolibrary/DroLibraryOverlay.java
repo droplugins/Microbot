@@ -29,14 +29,19 @@ public class DroLibraryOverlay extends OverlayPanel {
         panelComponent.getChildren().clear();
         panelComponent.getChildren().add(LineComponent.builder()
                 .left("Dro Library:")
-                .right("Running")
+                .right("Active")
                 .rightColor(Color.GREEN)
                 .build());
 
-        String target = script.getCurrentTargetBook();
+        panelComponent.getChildren().add(LineComponent.builder()
+                .left("State:")
+                .right(script.getCurrentState())
+                .build());
+
+        Book target = script.getCurrentTargetBook();
         panelComponent.getChildren().add(LineComponent.builder()
                 .left("Target Book:")
-                .right(target != null ? target : "Finding customer...")
+                .right(target != null ? target.getName() : "Getting Assignment...")
                 .build());
 
         return super.render(graphics);
