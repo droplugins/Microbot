@@ -118,8 +118,8 @@
 2975 3938 0	89 Magic	Lunar Diplomacy	19	4070=2		Y	10	Ice Plateau Teleport	WATER_RUNE=8&&ASTRAL_RUNE=3&&LAW_RUNE=3
 								
 # Arceuus Spellbook - Varbit 4070=3								
-# Arceuus Library Teleport								
-1632 3834 0	6 Magic		19	4070=3		Y	10	Arceuus Library Teleport	EARTH_RUNE=2&&LAW_RUNE=1
+# Arceuus net.runelite.client.plugins.microbot.drolibrary1.0.net.runelite.client.plugins.microbot.drolibrary1.Library Teleport
+1632 3834 0	6 Magic		19	4070=3		Y	10	Arceuus net.runelite.client.plugins.microbot.drolibrary1.0.net.runelite.client.plugins.microbot.drolibrary1.Library Teleport	EARTH_RUNE=2&&LAW_RUNE=1
 								
 # Draynor Manor Teleport								
 3108 3351 0	17 Magic		19	4070=3		Y	4	Draynor Manor Teleport	EARTH_RUNE=1&&WATER_RUNE=1&&LAW_RUNE=1

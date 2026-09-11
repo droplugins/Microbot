@@ -1,6 +1,6 @@
 # Destination	menuOption menuTarget objectID	Skills	Item IDs	Quests	Duration	Display info	Consumable	Wilderness level	Varbits	Varplayers
 # Clue compass
-1641 3809 0			30363		4	Clue compass: 4. Arceuus Library	F	20	10032>0
+1641 3809 0			30363		4	Clue compass: 4. Arceuus net.runelite.client.plugins.microbot.drolibrary1.0.net.runelite.client.plugins.microbot.drolibrary1.Library	F	20	10032>0
 3110 3420 0			30363		4	Clue compass: B. Barbarian Village	F	20	10032>0
 1663 10045 0			30363		4	Clue compass: H. Catacombs of Kourend	F	20	10032>0
 3375 3419 0			30363		4	Clue compass: Q. Digsite	F	20	10032>0

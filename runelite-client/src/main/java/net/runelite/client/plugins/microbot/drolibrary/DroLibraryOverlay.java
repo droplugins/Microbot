@@ -28,7 +28,7 @@ public class DroLibraryOverlay extends OverlayPanel {
 
         panelComponent.getChildren().clear();
         panelComponent.getChildren().add(LineComponent.builder()
-                .left("Dro Library:")
+                .left("Dro Library " + DroLibraryScript.VERSION)
                 .right("Active")
                 .rightColor(Color.GREEN)
                 .build());
@@ -38,12 +38,28 @@ public class DroLibraryOverlay extends OverlayPanel {
                 .right(script.getCurrentState())
                 .build());
 
+        panelComponent.getChildren().add(LineComponent.builder()
+                .left("Action:")
+                .right(display(script.getLastAction()))
+                .build());
+
+        panelComponent.getChildren().add(LineComponent.builder()
+                .left("Customer:")
+                .right(script.isCustomerLocked()
+                        ? script.getCurrentCustomerName() : "Getting assignment")
+                .build());
+
         Book target = script.getCurrentTargetBook();
         panelComponent.getChildren().add(LineComponent.builder()
-                .left("Target Book:")
-                .right(target != null ? target.getName() : "Getting Assignment...")
+                .left("Target:")
+                .right(target != null ? target.getShortName() : "None")
                 .build());
 
         return super.render(graphics);
+    }
+
+    private String display(String value)
+    {
+        return value == null || value.trim().isEmpty() ? "Unknown" : value;
     }
 }

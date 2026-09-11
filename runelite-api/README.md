@@ -3,7 +3,7 @@
 What it does: Provides the RuneLite public API artifacts consumed by `runelite-client` and plugins (interfaces, events, data models).
 
 Public entry points
-- Library jar only; no runtime main.
+- net.runelite.client.plugins.microbot.drolibrary1.0.net.runelite.client.plugins.microbot.drolibrary1.Library jar only; no runtime main.
 - Published via included-build coordinates `net.runelite:runelite-api`.
 
 How to build/test

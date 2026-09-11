@@ -1,12 +1,16 @@
 package net.runelite.client.plugins.microbot.drolibrary;
 
 import net.runelite.api.NPC;
+import net.runelite.api.TileObject;
 import net.runelite.api.coords.WorldPoint;
 import net.runelite.client.plugins.microbot.Microbot;
 import net.runelite.client.plugins.microbot.Script;
+import net.runelite.client.plugins.microbot.util.antiban.Rs2Antiban;
+import net.runelite.client.plugins.microbot.util.camera.Rs2Camera;
 import net.runelite.client.plugins.microbot.util.dialogues.Rs2Dialogue;
 import net.runelite.client.plugins.microbot.util.gameobject.Rs2GameObject;
 import net.runelite.client.plugins.microbot.util.inventory.Rs2Inventory;
+import net.runelite.client.plugins.microbot.util.misc.Rs2UiHelper;
 import net.runelite.client.plugins.microbot.util.npc.Rs2Npc;
 import net.runelite.client.plugins.microbot.util.player.Rs2Player;
 import net.runelite.client.plugins.microbot.util.walker.Rs2Walker;
@@ -14,9 +18,11 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import javax.inject.Inject;
+import javax.inject.Singleton;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
@@ -30,6 +36,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
  *    rather than asking getGameObject(id) to choose between several identical
  *    stair objects.
  */
+@Singleton
 public class DroLibraryScript extends Script
 {
     private static final Logger logger = LoggerFactory.getLogger(DroLibraryScript.class);
@@ -40,6 +47,30 @@ public class DroLibraryScript extends Script
     private static final int NPC_PROFESSOR_GRACKLEBONE = 7048;
     private static final int NPC_SAM = 7049;
     private static final int BOOK_OF_ARCANE_KNOWLEDGE = 13513;
+
+    public static final String VERSION = "1.02";
+    private static final int MIN_STARTUP_ZOOM = 95;
+    private static final int MAX_STARTUP_ZOOM = 105;
+    private static final int MIN_STARTUP_PITCH = 3000;
+    private static final int MAX_STARTUP_PITCH = 3064;
+    private static final int NORTH_YAW = 0;
+
+    private static final int LIBRARY_MIN_X = 1605;
+    private static final int LIBRARY_MAX_X = 1660;
+    private static final int LIBRARY_MIN_Y = 3782;
+    private static final int LIBRARY_MAX_Y = 3833;
+
+    private static final long MIN_REST_INTERVAL_MS = TimeUnit.MINUTES.toMillis(1);
+    private static final long MAX_REST_INTERVAL_MS = TimeUnit.MINUTES.toMillis(4);
+    private static final long MIN_REST_DURATION_MS = TimeUnit.SECONDS.toMillis(3);
+    private static final long MAX_REST_DURATION_MS = TimeUnit.SECONDS.toMillis(13);
+    private static final long STAIR_RETRY_DELAY_MS = 1200L;
+    private static final int MIN_PATH_BOOK_RADIUS = 10;
+    private static final int MAX_PATH_BOOK_RADIUS = 18;
+    private static final int MIN_RUN_ENABLE_PERCENT = 25;
+    private static final int MAX_RUN_ENABLE_PERCENT = 40;
+    private static final int MIN_INPUT_DELAY_MS = 50;
+    private static final int MAX_INPUT_DELAY_MS = 260;
 
     private static final int[] CUSTOMER_IDS =
             {NPC_VILLIA, NPC_PROFESSOR_GRACKLEBONE, NPC_SAM};
@@ -107,7 +138,7 @@ public class DroLibraryScript extends Script
                     new Stair(27852, new WorldPoint(1621, 3795, 2), 1, "Top South down"),
 
                     // Central: top -> middle central room
-                    new Stair(27852, new WorldPoint(1638, 3808, 2), 1, "Top Central down"),
+                    new Stair(27852, new WorldPoint(1638, 3805, 2), 1, "Top Central down"),
 
                     // NE: top -> middle
                     new Stair(27852, new WorldPoint(1647, 3828, 2), 1, "Top NE down"),
@@ -127,9 +158,9 @@ public class DroLibraryScript extends Script
     @Inject
     private Library library;
 
-    private int currentCustomerId = -1;
-    private Book currentTargetBook = null;
-    private boolean customerLocked = false;
+    private volatile int currentCustomerId = -1;
+    private volatile Book currentTargetBook = null;
+    private volatile boolean customerLocked = false;
     private int customerSearchIndex = 0;
 
     /* Customer who actually opened the current dialogue.  This is critical
@@ -138,9 +169,9 @@ public class DroLibraryScript extends Script
     private int dialogueCustomerId = -1;
     private boolean rotateCustomerAfterDialogue = false;
 
-    private String currentStateStr = "Initializing";
-    private String lastAction = "Starting";
-    private String lastSearchResult = "None";
+    private volatile String currentStateStr = "Initializing";
+    private volatile String lastAction = "Starting";
+    private volatile String lastSearchResult = "None";
     private long lastInteractionTime = 0L;
 
     /* Prevent repeatedly clicking the same staircase while the plane change is pending. */
@@ -157,6 +188,97 @@ public class DroLibraryScript extends Script
     private int turnInRewardCount;
     private long lastTurnInAttempt;
     private long lastStaminaAttempt;
+    private boolean sessionInitialized;
+    private long nextRestAt = Long.MAX_VALUE;
+    private long restUntil;
+    private long lastCameraAttempt;
+    private long lastNpcCameraAttempt;
+    private int pathBookRadius = 14;
+    private int runEnablePercent = 32;
+
+    private long randomBetween(long minimum, long maximum)
+    {
+        return ThreadLocalRandom.current().nextLong(minimum, maximum + 1);
+    }
+
+    private void pauseBeforeInput()
+    {
+        sleep(ThreadLocalRandom.current().nextInt(
+                MIN_INPUT_DELAY_MS, MAX_INPUT_DELAY_MS + 1));
+    }
+
+    private void clickContinue()
+    {
+        pauseBeforeInput();
+        Rs2Dialogue.clickContinue();
+    }
+
+    private void initializeSession()
+    {
+        if (sessionInitialized)
+            return;
+
+        int startupZoom = ThreadLocalRandom.current()
+                .nextInt(MIN_STARTUP_ZOOM, MAX_STARTUP_ZOOM + 1);
+        int startupPitch = ThreadLocalRandom.current()
+                .nextInt(MIN_STARTUP_PITCH, MAX_STARTUP_PITCH + 1);
+        pathBookRadius = ThreadLocalRandom.current()
+                .nextInt(MIN_PATH_BOOK_RADIUS, MAX_PATH_BOOK_RADIUS + 1);
+        runEnablePercent = ThreadLocalRandom.current()
+                .nextInt(MIN_RUN_ENABLE_PERCENT, MAX_RUN_ENABLE_PERCENT + 1);
+        Microbot.getClientThread().invoke(() ->
+        {
+            Microbot.getClient().setCameraPitchTarget(startupPitch);
+            Microbot.getClient().setCameraYawTarget(NORTH_YAW);
+        });
+        Rs2Camera.setZoom(startupZoom);
+        nextRestAt = System.currentTimeMillis()
+                + randomBetween(MIN_REST_INTERVAL_MS, MAX_REST_INTERVAL_MS);
+        sessionInitialized = true;
+        logger.info("[DroLibraryScript] Session initialized: version={} zoom={} rawPitch={} yaw={} pathBookRadius={} runAt={} next rest in {} seconds",
+                VERSION, startupZoom, startupPitch, NORTH_YAW, pathBookRadius, runEnablePercent,
+                TimeUnit.MILLISECONDS.toSeconds(nextRestAt - System.currentTimeMillis()));
+    }
+
+    /**
+     * Start breaks only while fully idle. This keeps a due break from interrupting
+     * a walk, staircase transition, animation, or dialogue.
+     */
+    private boolean handleScheduledRest()
+    {
+        long now = System.currentTimeMillis();
+        if (restUntil > now)
+        {
+            currentStateStr = "RESTING";
+            lastAction = "Resting for " + Math.max(1L,
+                    TimeUnit.MILLISECONDS.toSeconds(restUntil - now)) + "s";
+            return true;
+        }
+
+        if (restUntil != 0L)
+        {
+            restUntil = 0L;
+            nextRestAt = now + randomBetween(MIN_REST_INTERVAL_MS, MAX_REST_INTERVAL_MS);
+            logger.info("[DroLibraryScript] Rest complete; next rest in {} seconds",
+                    TimeUnit.MILLISECONDS.toSeconds(nextRestAt - now));
+        }
+
+        if (now < nextRestAt
+                || Rs2Dialogue.isInDialogue()
+                || Rs2Player.isMoving()
+                || Rs2Player.isAnimating())
+            return false;
+
+        long duration = randomBetween(MIN_REST_DURATION_MS, MAX_REST_DURATION_MS);
+        restUntil = now + duration;
+        nextRestAt = Long.MAX_VALUE;
+        currentStateStr = "RESTING";
+        lastAction = "Starting " + TimeUnit.MILLISECONDS.toSeconds(duration) + "s rest";
+        logger.info("[DroLibraryScript] Starting scheduled rest for {} ms", duration);
+        pauseBeforeInput();
+        Rs2Antiban.moveMouseOffScreen();
+        return true;
+    }
 
     private int itemCount(int id)
     {
@@ -283,8 +405,11 @@ public class DroLibraryScript extends Script
                 if (!super.run())
                     return;
 
+                initializeSession();
                 drainObservations();
                 checkTurnInCompletion();
+                if (handleScheduledRest())
+                    return;
                 State state = getState();
                 currentStateStr = state.name();
                 logStatus(state);
@@ -333,6 +458,11 @@ public class DroLibraryScript extends Script
         rotateCustomerAfterDialogue = false;
         lastStairTile = null;
         lastStairInteraction = 0L;
+        sessionInitialized = false;
+        nextRestAt = Long.MAX_VALUE;
+        restUntil = 0L;
+        lastCameraAttempt = 0L;
+        lastNpcCameraAttempt = 0L;
 
         super.shutdown();
     }
@@ -396,7 +526,7 @@ public class DroLibraryScript extends Script
     {
         if (closingCompletedDialogue)
         {
-            if (Rs2Dialogue.isInDialogue()) Rs2Dialogue.clickContinue();
+            if (Rs2Dialogue.isInDialogue()) clickContinue();
             else closingCompletedDialogue = false;
             return;
         }
@@ -471,7 +601,7 @@ public class DroLibraryScript extends Script
         logger.info("[DroLibraryScript] Attempting assignment from {} (id={})",
                 customerName(npcId), npcId);
 
-        if (Rs2Npc.interact(npcId, "Help"))
+        if (interactCustomer(npc, "Help"))
         {
             lastInteractionTime = System.currentTimeMillis();
             lastAction = "Talking to " + customerName(npcId);
@@ -504,7 +634,7 @@ public class DroLibraryScript extends Script
                 logger.info("[DroLibraryScript] Closing non-assignment dialogue with {}: {}",
                         customerName(dialogueCustomerId), text);
 
-            Rs2Dialogue.clickContinue();
+            clickContinue();
             if (!Rs2Dialogue.isInDialogue())
             {
                 customerSearchIndex = (customerIndexForId(dialogueCustomerId) + 1) % CUSTOMER_IDS.length;
@@ -516,7 +646,7 @@ public class DroLibraryScript extends Script
 
         if (text == null || text.trim().isEmpty())
         {
-            Rs2Dialogue.clickContinue();
+            clickContinue();
             return;
         }
 
@@ -530,7 +660,7 @@ public class DroLibraryScript extends Script
         {
             rotateCustomerAfterDialogue = true;
             lastAction = customerName(dialogueCustomerId) + " already completed - trying next customer";
-            Rs2Dialogue.clickContinue();
+            clickContinue();
             return;
         }
 
@@ -538,7 +668,7 @@ public class DroLibraryScript extends Script
         {
             rotateCustomerAfterDialogue = true;
             lastAction = customerName(dialogueCustomerId) + " is busy";
-            Rs2Dialogue.clickContinue();
+            clickContinue();
             return;
         }
 
@@ -562,11 +692,11 @@ public class DroLibraryScript extends Script
 
             /* Keep dialogueCustomerId tied to the locked customer until the
              * assignment dialogue has completely closed. */
-            Rs2Dialogue.clickContinue();
+            clickContinue();
             return;
         }
 
-        Rs2Dialogue.clickContinue();
+        clickContinue();
     }
 
     private void handleLockedCustomerDialogue()
@@ -579,7 +709,7 @@ public class DroLibraryScript extends Script
             logger.info("[DroLibraryScript] Locked-customer dialogue with {}: {}",
                     customerName(currentCustomerId), text);
 
-        Rs2Dialogue.clickContinue();
+        clickContinue();
     }
 
     private NPC findNextVisibleCustomer()
@@ -790,6 +920,26 @@ public class DroLibraryScript extends Script
         return null;
     }
 
+    private Stair nearestGroundReturnStair(WorldPoint player)
+    {
+        Stair nearest = null;
+        int nearestDistance = Integer.MAX_VALUE;
+        for (Stair stair : TOP_DOWN_STAIRS)
+        {
+            // The central middle room has no route to the ground floor.
+            if (stair.name.contains("Central"))
+                continue;
+
+            int distance = player.distanceTo(stair.tile);
+            if (distance < nearestDistance)
+            {
+                nearest = stair;
+                nearestDistance = distance;
+            }
+        }
+        return nearest;
+    }
+
     private void handleNavigateFloors()
     {
         WorldPoint player = Rs2Player.getWorldLocation();
@@ -814,28 +964,9 @@ public class DroLibraryScript extends Script
                     : roomStair(MIDDLE_UP_STAIRS, room);
         }
         else
-            stair = roomStair(TOP_DOWN_STAIRS, goalPlane == 0 ? 0 : goalRoom);
-        if (stair != null && stair.name.equals("Middle NW up"))
-        {
-            // Resolve only this known-bad map entry from the currently loaded NW room.
-            // Keep every other stair, walking method and search interaction unchanged.
-            var locations = Rs2GameObject.getGameObjects(o -> o.getId() == 27851
-                            && o.getWorldLocation().getPlane() == 1
-                            && o.getWorldLocation().getX() >= 1605
-                            && o.getWorldLocation().getX() < 1625
-                            && o.getWorldLocation().getY() > 3815
-                            && o.getWorldLocation().getY() <= 3835)
-                    .stream().map(o -> o.getWorldLocation()).distinct()
-                    .collect(java.util.stream.Collectors.toList());
-            if (locations.size() != 1)
-            {
-                lastAction = "NW ascent paused: expected one loaded stair, found " + locations;
-                return;
-            }
-            WorldPoint actual = locations.get(0);
-            lastAction = "NW loaded stair: " + actual;
-            stair = new Stair(27851, actual, 2, "Middle NW up (loaded)");
-        }
+            stair = goalPlane == 0
+                    ? nearestGroundReturnStair(player)
+                    : roomStair(TOP_DOWN_STAIRS, goalRoom);
         if (stair != null)
             moveToAndUseStair(stair, stair.destinationPlane > plane ? "Climb-up" : "Climb-down");
     }
@@ -853,6 +984,14 @@ public class DroLibraryScript extends Script
         if (destination == null)
             return false;
 
+        if (!isInsideLibraryBounds(destination))
+        {
+            lastAction = "Blocked walk outside library: " + destination;
+            logger.warn("[DroLibraryScript] Refusing out-of-library local walk from {} to {}",
+                    Rs2Player.getWorldLocation(), destination);
+            return false;
+        }
+
         WorldPoint player = Rs2Player.getWorldLocation();
         if (player == null || player.getPlane() != destination.getPlane())
             return false;
@@ -860,8 +999,6 @@ public class DroLibraryScript extends Script
         if (Rs2Player.isMoving() || Rs2Player.isAnimating()
                 || System.currentTimeMillis() - lastWalkTime < 1800) return false;
         lastWalkTime = System.currentTimeMillis();
-        if (!Rs2Player.isRunEnabled() && Rs2Player.getRunEnergy() > 10)
-            Rs2Player.toggleRunEnergy(true);
         if (Rs2Player.getRunEnergy() < 40 && !Rs2Player.hasStaminaBuffActive()
                 && !Rs2Dialogue.isInDialogue()
                 && System.currentTimeMillis() - lastStaminaAttempt > 15000)
@@ -871,9 +1008,17 @@ public class DroLibraryScript extends Script
             if (potion != null)
             {
                 lastStaminaAttempt = System.currentTimeMillis();
+                pauseBeforeInput();
                 Rs2Inventory.interact(potion.getId(), "Drink");
                 return false;
             }
+        }
+        if (!Rs2Player.isRunEnabled() && Rs2Player.getRunEnergy() >= runEnablePercent)
+        {
+            pauseBeforeInput();
+            Rs2Player.toggleRunEnergy(true);
+            runEnablePercent = ThreadLocalRandom.current()
+                    .nextInt(MIN_RUN_ENABLE_PERCENT, MAX_RUN_ENABLE_PERCENT + 1);
         }
         WorldPoint step = destination;
         // Leave the NE ground wing through the corridor before heading south.
@@ -885,6 +1030,13 @@ public class DroLibraryScript extends Script
         if (span > 10)
             step = new WorldPoint(player.getX() + (int)Math.round(dx * 10.0 / span),
                     player.getY() + (int)Math.round(dy * 10.0 / span), player.getPlane());
+        if (!isInsideLibraryBounds(step))
+        {
+            lastAction = "Blocked unsafe local step: " + step;
+            logger.warn("[DroLibraryScript] Refusing unsafe local step {}", step);
+            return false;
+        }
+        pauseBeforeInput();
         boolean clicked = Rs2Walker.walkFastCanvas(step);
         if (!clicked)
             logger.warn("[DroLibraryScript] LOCAL WALK failed from {} to {}", player, destination);
@@ -925,22 +1077,14 @@ public class DroLibraryScript extends Script
         }
 
         if (Rs2Player.isMoving() || Rs2Player.isAnimating()
-                || System.currentTimeMillis() - lastStairInteraction < 6500)
+                || System.currentTimeMillis() - lastStairInteraction < STAIR_RETRY_DELAY_MS)
             return;
-        // Throttle failed clicks as well as successful ones.
-        lastStairInteraction = System.currentTimeMillis();
-        lastStairTile = stair.tile;
 
         lastAction = action + " " + stair.name;
         logger.info("[DroLibraryScript] STAIRS: floor={} targetFloor={} id={} tile={} action={}",
                 player.getPlane(), stair.destinationPlane, stair.id, stair.tile, action);
 
-        /*
-         * The exact tile is authoritative. The ID is logged for diagnostics.
-         * We do not call getGameObject(id), because IDs 27851/27852/27855/27856
-         * are repeated at multiple staircase locations.
-         */
-        if (Rs2GameObject.interact(stair.tile, action))
+        if (interactExactStair(stair, action))
         {
             lastStairInteraction = System.currentTimeMillis();
             lastStairTile = stair.tile;
@@ -955,9 +1099,88 @@ public class DroLibraryScript extends Script
         }
         else
         {
+            // A rejected/off-canvas click gets a short retry without slowing a
+            // correctly visible staircase interaction.
+            lastStairInteraction = System.currentTimeMillis();
             logger.info("[DroLibraryScript] STAIRS: interaction returned false id={} tile={}",
                     stair.id, stair.tile);
         }
+    }
+
+    /**
+     * Interact with the staircase object itself, never a generic tile point.
+     * A clipped or tiny clickbox is brought into view first and retried on the
+     * next loop; no speculative click is sent to the canvas.
+     */
+    private boolean interactExactStair(Stair stair, String action)
+    {
+        // The supplied map is authoritative. Tile interaction correctly
+        // resolves the paired stair objects used by this game.
+        pauseBeforeInput();
+        return Rs2GameObject.interact(stair.tile, action);
+    }
+
+    private boolean hasSafeClickbox(TileObject object)
+    {
+        if (object == null)
+            return false;
+
+        return Microbot.getClientThread().runOnClientThreadOptional(() ->
+        {
+            java.awt.Shape clickbox = object.getClickbox();
+            if (clickbox == null)
+                return false;
+
+            java.awt.Rectangle bounds = clickbox.getBounds();
+            int canvasWidth = Microbot.getClient().getCanvasWidth();
+            int canvasHeight = Microbot.getClient().getCanvasHeight();
+            java.awt.Rectangle safeCanvas = new java.awt.Rectangle(
+                    4, 4, Math.max(0, canvasWidth - 8), Math.max(0, canvasHeight - 8));
+            return bounds.width >= 6 && bounds.height >= 6 && safeCanvas.contains(bounds);
+        }).orElse(false);
+    }
+
+    /**
+     * Reject missing, clipped, and tiny NPC clickboxes before sending a mouse
+     * click. This prevents the fallback point from landing on the scene behind
+     * the customer when models overlap or are partly outside the canvas.
+     */
+    private boolean hasSafeNpcClickbox(NPC npc)
+    {
+        if (npc == null)
+            return false;
+
+        return Microbot.getClientThread().runOnClientThreadOptional(() ->
+        {
+            java.awt.Rectangle bounds = Rs2UiHelper.getActorClickbox(npc);
+            if (bounds == null)
+                return false;
+
+            int canvasWidth = Microbot.getClient().getCanvasWidth();
+            int canvasHeight = Microbot.getClient().getCanvasHeight();
+            java.awt.Rectangle safeCanvas = new java.awt.Rectangle(
+                    4, 4, Math.max(0, canvasWidth - 8), Math.max(0, canvasHeight - 8));
+            return bounds.width >= 6 && bounds.height >= 6 && safeCanvas.contains(bounds);
+        }).orElse(false);
+    }
+
+    private boolean interactCustomer(NPC npc, String action)
+    {
+        if (!hasSafeNpcClickbox(npc))
+        {
+            long now = System.currentTimeMillis();
+            if (now - lastNpcCameraAttempt >= 1000L)
+            {
+                lastNpcCameraAttempt = now;
+                pauseBeforeInput();
+                Rs2Camera.turnTo(npc);
+            }
+            lastAction = "Centering " + customerName(npc.getId()) + " before clicking";
+            return false;
+        }
+
+        pauseBeforeInput();
+        return Rs2Npc.interact(npc, action);
     }
 
     private void handleSearchShelf()
@@ -1012,6 +1235,7 @@ public class DroLibraryScript extends Script
         // Only a confirmed result event may mark a shelf empty. A click or
         // inventory timeout is not evidence (duplicates show an object dialog).
         retryAfter.put(targetTile, System.currentTimeMillis() + 30000);
+        pauseBeforeInput();
         if (!Rs2GameObject.interact(targetTile, "Search"))
         {
             lastAction = "Search interaction failed";
@@ -1019,6 +1243,38 @@ public class DroLibraryScript extends Script
         }
         sleepUntil(() -> !observations.isEmpty() || hasTargetBookInInventory(), 6000);
         drainObservations();
+    }
+
+    private boolean isBookshelfVisible(WorldPoint tile)
+    {
+        return Rs2GameObject.getAll(o -> o != null
+                        && tile.equals(o.getWorldLocation()))
+                .stream()
+                .anyMatch(this::hasSafeClickbox);
+    }
+
+    /** Distance from a shelf to the forward route segment, or infinity when behind/beyond it. */
+    private double distanceToRoute(WorldPoint shelf, WorldPoint from, WorldPoint destination)
+    {
+        if (shelf == null || from == null || destination == null
+                || shelf.getPlane() != from.getPlane()
+                || destination.getPlane() != from.getPlane())
+            return Double.POSITIVE_INFINITY;
+
+        double routeX = destination.getX() - from.getX();
+        double routeY = destination.getY() - from.getY();
+        double lengthSquared = routeX * routeX + routeY * routeY;
+        if (lengthSquared < 1.0)
+            return Double.POSITIVE_INFINITY;
+
+        double projection = ((shelf.getX() - from.getX()) * routeX
+                + (shelf.getY() - from.getY()) * routeY) / lengthSquared;
+        if (projection < 0.0 || projection > 1.0)
+            return Double.POSITIVE_INFINITY;
+
+        double routePointX = from.getX() + projection * routeX;
+        double routePointY = from.getY() + projection * routeY;
+        return Math.hypot(shelf.getX() - routePointX, shelf.getY() - routePointY);
     }
 
     private Bookcase getTargetBookcase()
@@ -1050,8 +1306,14 @@ public class DroLibraryScript extends Script
                 int score = priority * 10000 + distance;
                 if (score < bestScore) { best = shelf; bestScore = score; }
             }
-            if (player != null && Rs2Inventory.items().count() <= 24)
+            if (library.getState() == SolvedState.COMPLETE
+                    && player != null && best != null && Rs2Inventory.items().count() < 27
+                    && best.getLocation().getPlane() == player.getPlane()
+                    && (player.getPlane() != 1
+                    || middleRoom(player) == middleRoom(best.getLocation())))
             {
+                Bookcase nearbyBookcase = null;
+                double nearbyScore = Double.POSITIVE_INFINITY;
                 for (Bookcase shelf : library.getBookcases())
                 {
                     Book known = shelf.getBook();
@@ -1060,10 +1322,26 @@ public class DroLibraryScript extends Script
                         known = shelf.getPossibleBooks().iterator().next();
                     if (known == null || known == currentTargetBook || Rs2Inventory.contains(known.getItem())) continue;
                     if (retryAfter.getOrDefault(shelf.getLocation(), 0L) > System.currentTimeMillis()) continue;
-                    if (player.distanceTo(shelf.getLocation()) <= 2
-                            && (player.getPlane() != 1 || middleRoom(player) == middleRoom(shelf.getLocation()))
-                            && (best == null || player.distanceTo(best.getLocation()) > 2))
-                        return shelf;
+                    WorldPoint tile = shelf.getLocation();
+                    if (tile.getPlane() != player.getPlane()
+                            || (player.getPlane() == 1 && middleRoom(player) != middleRoom(tile))) continue;
+                    double routeDistance = distanceToRoute(tile, player, best.getLocation());
+                    if (routeDistance > pathBookRadius || !isBookshelfVisible(tile)) continue;
+
+                    // Prefer the smallest diversion, then the closest visible shelf.
+                    double score = routeDistance * 100.0 + player.distanceTo(tile);
+                    if (score < nearbyScore)
+                    {
+                        nearbyBookcase = shelf;
+                        nearbyScore = score;
+                    }
+                }
+                if (nearbyBookcase != null)
+                {
+                    logger.info("[DroLibraryScript] PATH BOOK: collecting {} at {} within {}-tile route radius",
+                            nearbyBookcase.getBook() == null ? "known book" : nearbyBookcase.getBook().getShortName(),
+                            nearbyBookcase.getLocation(), pathBookRadius);
+                    return nearbyBookcase;
                 }
             }
             return best;
@@ -1100,7 +1378,7 @@ public class DroLibraryScript extends Script
                         customerName(currentCustomerId), text);
 
             checkTurnInCompletion();
-            Rs2Dialogue.clickContinue();
+            clickContinue();
             sleep(500);
 
             checkTurnInCompletion();
@@ -1126,7 +1404,7 @@ public class DroLibraryScript extends Script
         beginTurnInTracking();
         dialogueCustomerId = currentCustomerId;
         lastTurnInAttempt = System.currentTimeMillis();
-        if (Rs2Npc.interact(currentCustomerId, "Help"))
+        if (interactCustomer(npc, "Help"))
             sleepUntil(Rs2Dialogue::isInDialogue, 3000);
         checkTurnInCompletion();
     }
@@ -1158,6 +1436,7 @@ public class DroLibraryScript extends Script
         {
             String skill = config.rewardType() == DroLibraryConfig.RewardType.MAGIC
                     ? "Magic" : "Runecraft";
+            pauseBeforeInput();
             boolean selected = Rs2Dialogue.clickOption(skill);
             lastAction = selected ? "Selected " + skill + " reward" : "Waiting for " + skill + " option";
             logger.info("[DroLibraryScript] REWARD skill={} selected={} options={}", skill, selected,
@@ -1170,6 +1449,7 @@ public class DroLibraryScript extends Script
         if (Rs2Inventory.contains(BOOK_OF_ARCANE_KNOWLEDGE))
         {
             lastAction = "Reading Arcane Knowledge";
+            pauseBeforeInput();
             Rs2Inventory.interact(BOOK_OF_ARCANE_KNOWLEDGE, "Read");
             sleep(1000);
         }
@@ -1177,13 +1457,18 @@ public class DroLibraryScript extends Script
 
     private boolean isInLibrary()
     {
-        WorldPoint p = Rs2Player.getWorldLocation();
-        if (p == null)
-            return false;
+        return isInsideLibraryBounds(Rs2Player.getWorldLocation());
+    }
 
-        return p.getRegionID() == 6553
-                || (p.getX() >= 1580 && p.getX() <= 1685
-                && p.getY() >= 3760 && p.getY() <= 3875);
+    private boolean isInsideLibraryBounds(WorldPoint point)
+    {
+        return point != null
+                && point.getX() >= LIBRARY_MIN_X
+                && point.getX() <= LIBRARY_MAX_X
+                && point.getY() >= LIBRARY_MIN_Y
+                && point.getY() <= LIBRARY_MAX_Y
+                && point.getPlane() >= 0
+                && point.getPlane() <= 2;
     }
 
     private String customerName(int id)

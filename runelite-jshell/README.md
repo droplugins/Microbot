@@ -3,7 +3,7 @@
 What it does: Provides JShell support artifacts used alongside the RuneLite client for interactive evaluation and debugging.
 
 Public entry points
-- Library jar only; consumed by `runelite-client` as project dependency `:jshell`.
+- net.runelite.client.plugins.microbot.drolibrary1.0.net.runelite.client.plugins.microbot.drolibrary1.Library jar only; consumed by `runelite-client` as project dependency `:jshell`.
 
 How to build/test
 - From root: `./gradlew -p runelite-jshell build`

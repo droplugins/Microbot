@@ -380,7 +380,7 @@ Upstream has `fromLocalInstance(Client client, Player localPlayer)` which handle
 | Teleportation Boxes | Yes | ✅ Yes — POH mounted items (`Mounted{Glory,Xerics,Digsite,Mythical}`) |
 | POH Teleportation Portals | Yes | ✅ Yes — `PohPortal` (40 dests after 2026-07-20 backfill) |
 | Pendant of Ates (Kastori, Nemus) | Yes | ✅ Yes — in `teleportation_items.tsv` |
-| Separate Kharedst's Memoir / Book of the Dead | Yes | ✅ Yes — in `teleportation_items.tsv` |
+| Separate Kharedst's Memoir / net.runelite.client.plugins.microbot.drolibrary1.0.net.runelite.client.plugins.microbot.drolibrary1.Book of the Dead | Yes | ✅ Yes — in `teleportation_items.tsv` |
 | Great Conch fairy ring (CJQ) | Yes | ✅ Yes — in `fairy_rings.tsv` |
 | Cowbell Amulet | Yes | ✅ Yes — `teleportation_items.tsv` (item 33104), backfilled 2026-07-20 |
 | Sailors' Amulet | Yes | ✅ Yes — `teleportation_items.tsv` (item 32399, 3 dests), backfilled 2026-07-20 |

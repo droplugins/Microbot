@@ -3,7 +3,7 @@
 What it does: Included build that packages cache tooling/resources required by the RuneLite client (mirrors upstream RuneLite `cache` module).
 
 Public entry points
-- Library/tooling jar only; no runtime main.
+- net.runelite.client.plugins.microbot.drolibrary1.0.net.runelite.client.plugins.microbot.drolibrary1.Library/tooling jar only; no runtime main.
 
 How to build/test
 - From root: `./gradlew -p cache build`

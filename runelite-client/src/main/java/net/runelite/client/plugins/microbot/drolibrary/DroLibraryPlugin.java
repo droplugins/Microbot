@@ -11,7 +11,7 @@ import javax.inject.Inject;
 
 @PluginDescriptor(
         name = "[Dro] Library",
-        description = "Native automated Kourend Library assistant plugin utilizing the internal solver",
+        description = "Dro Library 1.02 - automated Kourend Library assistant utilizing the internal solver",
         tags = {"kourend", "library", "microbot", "dro"},
         enabledByDefault = false
 )
