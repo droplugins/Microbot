@@ -21,7 +21,7 @@ import java.awt.AWTException;
 import java.time.Duration;
 
 @PluginDescriptor(
-        name = PluginConstants.MOCROSOFT + "Thieving",
+        name = "[Dro] Thieving",
         description = "Microbot thieving plugin",
         authors = { "Mocrosoft", "Kryox", "Jesusfh" },
         version = ThievingPlugin.version,

@@ -1,0 +1,34 @@
+package net.runelite.client.plugins.microbot.drochaos;
+
+import net.runelite.client.ui.overlay.OverlayPanel;
+import net.runelite.client.ui.overlay.components.LineComponent;
+
+import javax.inject.Inject;
+import java.awt.Dimension;
+import java.awt.Graphics2D;
+
+public class DroChaosOverlay extends OverlayPanel
+{
+    private final DroChaosScript script;
+
+    @Inject
+    DroChaosOverlay(DroChaosScript script)
+    {
+        this.script = script;
+    }
+
+    @Override
+    public Dimension render(Graphics2D graphics)
+    {
+        panelComponent.getChildren().clear();
+        panelComponent.getChildren().add(LineComponent.builder()
+                .left("DroChaos")
+                .right(script.getStatus())
+                .build());
+        panelComponent.getChildren().add(LineComponent.builder()
+                .left("Lumbridge bank")
+                .right(script.getBankName())
+                .build());
+        return super.render(graphics);
+    }
+}

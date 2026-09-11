@@ -23,7 +23,7 @@ import java.util.stream.Collectors;
 
 @PluginDescriptor(
 
-	name = PluginConstants.MOCROSOFT + "Agility",
+	name = "[Dro] Agility",
 	description = "Reliable multi-course agility plugin",
     authors = { "Dro" },
     version = DroAgilityPlugin.version,

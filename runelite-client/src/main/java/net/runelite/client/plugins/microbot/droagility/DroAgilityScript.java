@@ -58,10 +58,23 @@ public class DroAgilityScript extends Script
     // Increased zoom to maximum distance
     private static final int STARTUP_CAMERA_ZOOM = 100;
 
-    // Custom Antiban Timers
+    // Custom Antiban Timers & Scheduled Rest Constants
     private long nextMisclickTime = 0;
     private long nextShortDelayTime = 0;
     private long nextLongPauseTime = 0;
+
+    private static final long MIN_REST_INTERVAL_MS = TimeUnit.MINUTES.toMillis(5);
+    private static final long MAX_REST_INTERVAL_MS = TimeUnit.MINUTES.toMillis(25);
+    private static final long MIN_REST_DURATION_MS = TimeUnit.SECONDS.toMillis(1);
+    private static final long MAX_REST_DURATION_MS = TimeUnit.SECONDS.toMillis(7);
+    private static final int MIN_RUN_ENABLE_PERCENT = 18;
+    private static final int MAX_RUN_ENABLE_PERCENT = 100;
+    private static final int MIN_INPUT_DELAY_MS = 67;
+    private static final int MAX_INPUT_DELAY_MS = 333;
+
+    private long restUntil = 0L;
+    private long nextRestAt = 0L;
+    private int runEnablePercent = 50;
 
     @Inject
     public DroAgilityScript(DroAgilityPlugin plugin, DroAgilityConfig config)
@@ -88,6 +101,8 @@ public class DroAgilityScript extends Script
         supplyManager.reset();
         clearPendingMarkOfGrace();
         clearAlchDecision();
+        restUntil = 0L;
+        nextRestAt = Long.MAX_VALUE;
 
         super.shutdown();
         clearWalkingRouteForShutdown();
@@ -144,6 +159,13 @@ public class DroAgilityScript extends Script
                 {
                     return;
                 }
+
+                // Handle Scheduled Micro-Rests
+                if (handleScheduledRest())
+                {
+                    return;
+                }
+
                 DroAgilityCourseHandler courseHandler = getActiveHandler();
                 final WorldPoint playerWorldLocation = Microbot.getClientThread().runOnClientThreadOptional(() -> {
                     if (Microbot.getClient().getLocalPlayer() == null)
@@ -340,6 +362,12 @@ public class DroAgilityScript extends Script
 
         Rs2Camera.setZoom(STARTUP_CAMERA_ZOOM);
 
+        int randomPitch = ThreadLocalRandom.current().nextInt(2200, 2850);
+        Rs2Camera.setPitch(randomPitch);
+
+        runEnablePercent = ThreadLocalRandom.current().nextInt(MIN_RUN_ENABLE_PERCENT, MAX_RUN_ENABLE_PERCENT + 1);
+        nextRestAt = System.currentTimeMillis() + ThreadLocalRandom.current().nextLong(MIN_REST_INTERVAL_MS, MAX_REST_INTERVAL_MS);
+
         // Initialize Custom Antiban Timers
         long now = System.currentTimeMillis();
         nextMisclickTime = now + ThreadLocalRandom.current().nextLong(300_000, 600_000); // 5-10 mins
@@ -354,6 +382,39 @@ public class DroAgilityScript extends Script
         startPoint = initialHandler.getStartPoint();
         lastAgilityXp = getAgilityXp();
         sessionInitialized = true;
+        return true;
+    }
+
+    /**
+     * Handles scheduled rest periods to mimic human behavior intervals.
+     */
+    private boolean handleScheduledRest()
+    {
+        long now = System.currentTimeMillis();
+        if (restUntil > now)
+        {
+            return true;
+        }
+
+        if (restUntil != 0L)
+        {
+            restUntil = 0L;
+            nextRestAt = now + ThreadLocalRandom.current().nextLong(MIN_REST_INTERVAL_MS, MAX_REST_INTERVAL_MS);
+            Microbot.log("[DroAgilityScript] Rest complete; next rest in " + TimeUnit.MILLISECONDS.toSeconds(nextRestAt - now) + " seconds");
+        }
+
+        if (now < nextRestAt
+                || Rs2Player.isMoving()
+                || Rs2Player.isAnimating())
+        {
+            return false;
+        }
+
+        long duration = ThreadLocalRandom.current().nextLong(MIN_REST_DURATION_MS, MAX_REST_DURATION_MS);
+        restUntil = now + duration;
+        nextRestAt = Long.MAX_VALUE;
+        Microbot.log("[DroAgilityScript] Starting scheduled rest for " + duration + " ms");
+        Rs2Antiban.moveMouseOffScreen();
         return true;
     }
 
@@ -386,7 +447,6 @@ public class DroAgilityScript extends Script
         if (now > nextMisclickTime) {
             performSafeMisclick(gameObject);
             nextMisclickTime = System.currentTimeMillis() + ThreadLocalRandom.current().nextLong(300_000, 600_000);
-            // Do not return true here, we immediately proceed to click the correct obstacle to correct the misclick
         }
 
         return false;
@@ -399,14 +459,11 @@ public class DroAgilityScript extends Script
     {
         WorldPoint targetLoc = target.getWorldLocation();
         if (targetLoc != null) {
-            // Offset by 1 tile in a random direction to hit a valid walk tile rather than dead air
             int dx = ThreadLocalRandom.current().nextBoolean() ? 1 : -1;
             int dy = ThreadLocalRandom.current().nextBoolean() ? 1 : -1;
             WorldPoint misclickPoint = targetLoc.dx(dx).dy(dy);
 
             Rs2Walker.walkFastCanvas(misclickPoint);
-
-            // Simulate human recovery time before clicking the actual obstacle
             sleep(400, 1200);
         }
     }
