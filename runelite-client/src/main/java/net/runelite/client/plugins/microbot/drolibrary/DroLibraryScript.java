@@ -107,7 +107,7 @@ public class DroLibraryScript extends Script
                     new Stair(27852, new WorldPoint(1621, 3795, 2), 1, "Top South down"),
 
                     // Central: top -> middle central room
-                    new Stair(27852, new WorldPoint(1638, 3805, 2), 1, "Top Central down"),
+                    new Stair(27852, new WorldPoint(1638, 3808, 2), 1, "Top Central down"),
 
                     // NE: top -> middle
                     new Stair(27852, new WorldPoint(1647, 3828, 2), 1, "Top NE down"),
