@@ -28,6 +28,7 @@ import net.runelite.client.plugins.microbot.util.equipment.Rs2Equipment;
 import net.runelite.client.plugins.microbot.util.grounditem.Rs2GroundItem;
 import net.runelite.client.plugins.microbot.api.tileobject.models.Rs2TileObjectModel;
 import net.runelite.client.plugins.microbot.util.inventory.Rs2Inventory;
+import net.runelite.client.plugins.microbot.util.inventory.InteractOrder;
 import net.runelite.client.plugins.microbot.util.magic.Rs2Magic;
 import net.runelite.client.plugins.microbot.util.models.RS2Item;
 import net.runelite.client.plugins.microbot.util.npc.Rs2Npc;
@@ -77,6 +78,11 @@ public class ThievingScript extends Script {
     protected volatile long forceShadowVeilActive = System.currentTimeMillis()-1_000;
     private long nextShadowVeil = 0;
     private long startupGraceUntil = 0;
+    private static final int NPC_RECOVERY_LIMIT = 15;
+    private static final int MIN_FREE_INVENTORY_SLOTS = 2;
+    private int npcRecoveryAttempts = 0;
+    private long lastNpcRecoveryAt = 0;
+    private long lastNpcInteractionAt = 0;
     private final Map<ThievingNpc, ThievingNpcStrategy> npcStrategies = Map.of(
             ThievingNpc.WEALTHY_CITIZEN, new WealthyCitizenStrategy()
     );
@@ -275,7 +281,7 @@ public class ThievingScript extends Script {
 
     private State getCurrentState() {
         // Grace period right after startup/login to allow inventory/bank to populate.
-        if (System.currentTimeMillis() < startupGraceUntil) return State.WALK_TO_START;
+        if (System.currentTimeMillis() < startupGraceUntil) return State.IDLE;
 
         if (getMostExpensiveGroundItemId() != -1) return applyOverride(State.LOOT);
 
@@ -301,7 +307,7 @@ public class ThievingScript extends Script {
             }
         }
 
-        if (Rs2Inventory.emptySlotCount() < 3) return applyOverride(State.DROP);
+        if (Rs2Inventory.emptySlotCount() < MIN_FREE_INVENTORY_SLOTS) return applyOverride(State.DROP);
 
         if (isNpcNull(thievingNpc) && (thievingNpc = getThievingNpcCache()) == null && shouldHop()) return applyOverride(State.HOP);
 
@@ -358,7 +364,10 @@ public class ThievingScript extends Script {
     }
 
     protected boolean shouldRun() {
-        if (!Microbot.isLoggedIn()) return false;
+        if (!Microbot.isLoggedIn()) {
+            startupGraceUntil = System.currentTimeMillis() + 4_000;
+            return false;
+        }
         return true;
     }
 
@@ -392,6 +401,8 @@ public class ThievingScript extends Script {
             log.error("{} to null", info);
             return false;
         }
+        final WorldPoint location = Rs2Player.getWorldLocation();
+        if (location != null && location.distanceTo(dst) <= distance) return true;
         log.debug("{} to {}", info, toString(dst));
         final WalkerState walkerState = Rs2Walker.walkWithState(dst, distance);
         log.debug("{} @ {} - dst={}", walkerState, Rs2Player.getWorldLocation(), dst);
@@ -430,7 +441,14 @@ public class ThievingScript extends Script {
             case LOOT:
                 final int id = getMostExpensiveGroundItemId();
                 if (id == -1) return;
-                if (Rs2Inventory.emptySlotCount() < 3) dropAllExceptImportant();
+                if (Rs2Inventory.emptySlotCount() < MIN_FREE_INVENTORY_SLOTS) {
+                    dropExcessConfiguredFood();
+                    dropAllExceptImportant();
+                    sleepUntilWithInterrupt(
+                            () -> Rs2Inventory.emptySlotCount() >= MIN_FREE_INVENTORY_SLOTS,
+                            1_800);
+                    if (Rs2Inventory.emptySlotCount() < MIN_FREE_INVENTORY_SLOTS) return;
+                }
                 final Rs2TileItemModel item = Microbot.getRs2TileItemCache().query().withId(id).within(50).nearest();
                 if (item == null) {
                     log.warn("Loot Item is null");
@@ -496,8 +514,21 @@ public class ThievingScript extends Script {
                 }
                 return;
             case DROP:
+                dropExcessConfiguredFood();
                 dropAllExceptImportant();
-                if (Rs2Inventory.emptySlotCount() < 3) Rs2Player.eatAt(99);
+                if (Rs2Inventory.emptySlotCount() < MIN_FREE_INVENTORY_SLOTS) {
+                    sleepUntilWithInterrupt(
+                            () -> Rs2Inventory.emptySlotCount() >= MIN_FREE_INVENTORY_SLOTS,
+                            1_800);
+                }
+                if (Rs2Inventory.emptySlotCount() < MIN_FREE_INVENTORY_SLOTS
+                        && config.useFood()
+                        && config.food() != ThievingFood.ANCIENT_BREW) {
+                    Rs2Player.eatAt(99);
+                    sleepUntilWithInterrupt(
+                            () -> Rs2Inventory.emptySlotCount() >= MIN_FREE_INVENTORY_SLOTS,
+                            1_800);
+                }
                 return;
             case HOP:
                 if (shouldHop()) {
@@ -593,9 +624,12 @@ public class ThievingScript extends Script {
                 var highlighted = net.runelite.client.plugins.npchighlight.NpcIndicatorsPlugin.getHighlightedNpcs();
                 if (highlighted.isEmpty()) {
                     if (isNpcNull(thievingNpc)) return;
-                    Rs2Npc.pickpocket(thievingNpc.getNpc());
+                    pickpocketWithRecovery(thievingNpc);
                 } else {
-                    Rs2Npc.pickpocket(highlighted);
+                    for (net.runelite.api.NPC npc : highlighted.keySet()) {
+                        pickpocketWithRecovery(new Rs2NpcModel(npc));
+                        break;
+                    }
                 }
                 lastAction = System.currentTimeMillis();
                 return;
@@ -605,8 +639,60 @@ public class ThievingScript extends Script {
         }
     }
 
+    private void pickpocketWithRecovery(Rs2NpcModel npc) {
+        if (npc == null || npc.getNpc() == null) return;
+
+        final long now = System.currentTimeMillis();
+        if (Microbot.cantReachTarget && lastNpcInteractionAt > 0 && now - lastNpcInteractionAt <= 5_000) {
+            Microbot.cantReachTarget = false;
+            npcRecoveryAttempts++;
+            lastNpcRecoveryAt = now;
+
+            if (npcRecoveryAttempts >= NPC_RECOVERY_LIMIT) {
+                Microbot.pauseAllScripts.compareAndSet(false, true);
+                Microbot.showMessage("Your bot tried to interact with an NPC for "
+                        + npcRecoveryAttempts
+                        + " times but failed. Please take a look at what is happening.");
+                return;
+            }
+
+            final WorldPoint npcLocation = npc.getWorldLocation();
+            if (npcLocation != null) {
+                walkTo("Recover NPC interaction", npcLocation, 1);
+            }
+            return;
+        }
+
+        // Ignore a stale can't-reach message produced before this NPC interaction
+        // sequence (for example, by an earlier walking action).
+        if (Microbot.cantReachTarget) {
+            Microbot.cantReachTarget = false;
+        }
+
+        // A few seconds without another can't-reach response indicates that the
+        // recovery worked. Reset here rather than immediately after the click,
+        // because the game reports interaction failures asynchronously.
+        if (npcRecoveryAttempts > 0 && now - lastNpcRecoveryAt >= 5_000) {
+            npcRecoveryAttempts = 0;
+        }
+
+        lastNpcInteractionAt = now;
+        Rs2Npc.pickpocket(npc.getNpc());
+    }
+
     public boolean run() {
-        Microbot.isCantReachTargetDetectionEnabled = true;
+        if (mainScheduledFuture != null && !mainScheduledFuture.isDone()) return true;
+        Microbot.cantReachTarget = false;
+        Microbot.cantReachTargetRetries = 0;
+        thievingNpc = null;
+        cleanNpc = false;
+        currentState = State.IDLE;
+        npcRecoveryAttempts = 0;
+        lastNpcRecoveryAt = 0;
+        lastNpcInteractionAt = 0;
+        // This script handles unreachable-NPC recovery locally so its 15-attempt
+        // limit does not require changing the shared Rs2Npc utility.
+        Microbot.isCantReachTargetDetectionEnabled = false;
         lastAction = System.currentTimeMillis();
         nextShadowVeil = System.currentTimeMillis()+60_000;
         underAttack = false;
@@ -637,14 +723,17 @@ public class ThievingScript extends Script {
                     hasReqs = false;
                 }
             } else {
-                if (Rs2Inventory.getInventoryFood().isEmpty()) {
+                if (!Rs2Inventory.hasUnNotedItem(config.food().getName(), true)
+                        && Rs2Inventory.getInventoryFood().isEmpty()) {
                     log.debug("Missing food");
                     hasReqs = false;
                 }
             }
         }
 
-        if (config.dodgyNecklaceAmount() > 0 && !Rs2Inventory.hasItem("Dodgy necklace")) {
+        if (config.dodgyNecklaceAmount() > 0
+                && !Rs2Equipment.isWearing("Dodgy necklace")
+                && !Rs2Inventory.hasUnNotedItem("Dodgy necklace", true)) {
             log.debug("Missing dodgy necklaces");
             hasReqs = false;
         }
@@ -803,8 +892,10 @@ public class ThievingScript extends Script {
     private boolean repeatedAction(Runnable action, BooleanSupplier awaitedCondition, BooleanSupplier interruptCondition, int maxTries) {
         for (int i = 0; i < maxTries; i++) {
             if (awaitedCondition.getAsBoolean()) return true;
+            if (interruptCondition.getAsBoolean()) throw new SelfInterruptException("Should not be running");
             action.run();
-            sleepUntilWithInterrupt(awaitedCondition, interruptCondition, 2_000);
+            if (interruptCondition.getAsBoolean()) throw new SelfInterruptException("Should not be running");
+            if (sleepUntilWithInterrupt(awaitedCondition, interruptCondition, 2_000)) return true;
         }
         return false;
     }
@@ -910,7 +1001,9 @@ public class ThievingScript extends Script {
     }
 
     private void bankAndEquip() {
-        if (!Rs2Bank.isOpen()) {
+        final boolean bankWasOpen = Rs2Bank.isOpen();
+        final int bankEpoch = Rs2Bank.getBankLiveEpoch();
+        if (!bankWasOpen) {
             BankLocation bank;
             if (config.THIEVING_NPC() == ThievingNpc.VYRES && ThievingData.OUTSIDE_HALLOWED_BANK.distanceTo(Rs2Player.getWorldLocation()) < 20) {
                 log.debug("Near Hallowed");
@@ -934,6 +1027,10 @@ public class ThievingScript extends Script {
         }
 
         if (!Rs2Bank.isOpen() || !isRunning()) return;
+        if (!sleepUntilWithInterrupt(
+                () -> Rs2Bank.verifyBankMirrorAfterOpen(bankWasOpen, bankEpoch),
+                () -> !shouldRun() || !Rs2Bank.isOpen(), 4_000)) return;
+        if (!Rs2Bank.setWithdrawAsItem()) return;
         Rs2Bank.depositAllExcept(getExclusions());
 
         if (config.useFood()) {
@@ -945,7 +1042,11 @@ public class ThievingScript extends Script {
 
             if (!getInventoryAmount(itemName, config.foodAmount(), true)) {
                 if (!Rs2Bank.isOpen()) return;
-                showMessage("No " + config.food().getName() + " found in bank.");
+                showMessage("Could not restock " + itemName
+                        + ". Inventory: " + Rs2Inventory.itemQuantity(itemName, true)
+                        + ", requested: " + config.foodAmount()
+                        + ", bank currently reports: " + Rs2Bank.count(itemName, true)
+                        + ". Check available quantity, inventory space and bank loading.");
                 shutdown();
                 return;
             }
@@ -1038,6 +1139,17 @@ public class ThievingScript extends Script {
         Collections.addAll(keep, "coins", "book of the dead");
         if (config.THIEVING_NPC() == ThievingNpc.VYRES) Collections.addAll(keep,"drakan's medallion", "blood shard");
         Rs2Inventory.dropAllExcept(config.keepItemsAboveValue(), keep.toArray(String[]::new));
+    }
+
+    private void dropExcessConfiguredFood() {
+        if (!config.useFood() || config.food() == ThievingFood.ANCIENT_BREW) return;
+
+        final String foodName = config.food().getName();
+        final int excess = Rs2Inventory.itemQuantity(foodName, true) - config.foodAmount();
+        if (excess > 0) {
+            log.debug("Dropping {} excess {}", excess, foodName);
+            Rs2Inventory.dropAmount(foodName, excess, InteractOrder.STANDARD, true);
+        }
     }
 
 
