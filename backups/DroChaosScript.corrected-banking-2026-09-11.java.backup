@@ -3,13 +3,12 @@ package net.runelite.client.plugins.microbot.drochaos;
 import lombok.Getter;
 import lombok.extern.slf4j.Slf4j;
 import net.runelite.api.Client;
+import net.runelite.api.GameObject;
 import net.runelite.api.InventoryID;
 import net.runelite.api.Item;
 import net.runelite.api.ItemContainer;
 import net.runelite.api.ItemID;
 import net.runelite.api.Player;
-import net.runelite.api.Quest;
-import net.runelite.api.QuestState;
 import net.runelite.api.Skill;
 import net.runelite.api.WorldType;
 import net.runelite.api.coords.WorldArea;
@@ -21,7 +20,9 @@ import net.runelite.client.plugins.microbot.shortestpath.ShortestPathPlugin;
 import net.runelite.client.plugins.microbot.util.bank.Rs2Bank;
 import net.runelite.client.plugins.microbot.util.bank.enums.BankLocation;
 import net.runelite.client.plugins.microbot.util.combat.Rs2Combat;
+import net.runelite.client.plugins.microbot.util.dialogues.Rs2Dialogue;
 import net.runelite.client.plugins.microbot.util.equipment.Rs2Equipment;
+import net.runelite.client.plugins.microbot.util.gameobject.Rs2GameObject;
 import net.runelite.client.plugins.microbot.util.inventory.Rs2Inventory;
 import net.runelite.client.plugins.microbot.util.inventory.Rs2ItemModel;
 import net.runelite.client.plugins.microbot.util.player.Rs2Player;
@@ -36,6 +37,16 @@ import java.util.concurrent.atomic.AtomicBoolean;
 @Slf4j
 public class DroChaosScript extends Script
 {
+    private enum BankingStage
+    {
+        OPEN_BANK,
+        CLEAR_INVENTORY,
+        EQUIP_AMULET,
+        WITHDRAW_BONES,
+        VERIFY_SUPPLIES,
+        CLOSE_BANK
+    }
+
     private static final int CHAOS_ALTAR_ID = 411;
     private static final int MINIMUM_COMBAT_LEVEL = 3;
     private static final int MAXIMUM_COMBAT_LEVEL = 126;
@@ -49,6 +60,7 @@ public class DroChaosScript extends Script
     private static final WorldArea CHAOS_TEMPLE = new WorldArea(2947, 3818, 11, 6, 0);
     private static final WorldArea EDGEVILLE_RESPAWN_AREA = new WorldArea(3060, 3450, 66, 70, 0);
     private static final WorldArea LUMBRIDGE_BASEMENT_AREA = new WorldArea(3190, 9590, 60, 65, 0);
+    private static final WorldArea LUMBRIDGE_UNDERGROUND_AREA = new WorldArea(3150, 9500, 150, 200, 0);
     private static final WorldPoint CHAOS_ALTAR = new WorldPoint(2949, 3820, 0);
     private static final WorldPoint CHAOS_ALTAR_APPROACH = new WorldPoint(2972, 3810, 0);
 
@@ -57,6 +69,11 @@ public class DroChaosScript extends Script
     private boolean stateInitialized;
     private boolean wasInWilderness;
     private boolean mustBankBeforeTravel;
+    private volatile boolean intentionallySuiciding;
+    private BankingStage bankingStage = BankingStage.OPEN_BANK;
+    private BankLocation selectedBank;
+    private boolean boneWithdrawalIssued;
+    private int basementBankMisses;
     private final AtomicBoolean threatLogoutActive = new AtomicBoolean(false);
 
     @Getter
@@ -69,6 +86,15 @@ public class DroChaosScript extends Script
     {
         this.config = config;
         Microbot.enableAutoRunOn = false;
+        ShortestPathPlugin.exit();
+        stateInitialized = false;
+        wasInWilderness = false;
+        mustBankBeforeTravel = false;
+        intentionallySuiciding = false;
+        bankingStage = BankingStage.OPEN_BANK;
+        selectedBank = null;
+        boneWithdrawalIssued = false;
+        basementBankMisses = 0;
 
         scheduledFuture = scheduledExecutorService.scheduleWithFixedDelay(() -> {
             try
@@ -78,7 +104,7 @@ public class DroChaosScript extends Script
                     threatLogoutActive.set(false);
                     return;
                 }
-                if (Rs2Pvp.isInWilderness() && hasNearbyThreat())
+                if (Rs2Pvp.isInWilderness() && !intentionallySuiciding && hasNearbyThreat())
                 {
                     requestThreatLogout();
                 }
@@ -108,7 +134,7 @@ public class DroChaosScript extends Script
                     autoRetaliateConfigured = true;
                 }
 
-                if (logoutForThreat())
+                if (!intentionallySuiciding && logoutForThreat())
                 {
                     return;
                 }
@@ -126,34 +152,59 @@ public class DroChaosScript extends Script
 
     private void runLoopStep()
     {
-        boolean inWilderness = Rs2Pvp.isInWilderness();
+        WorldPoint location = getSafeWorldLocation();
+        if (location == null)
+        {
+            status = "Waiting for player";
+            return;
+        }
+
+        // The Wilderness varbit can lag behind the player position immediately
+        // after login. The coordinate calculation prevents a Wilderness start
+        // from being mistaken for a banking start during that window.
+        boolean inWilderness = Rs2Pvp.isInWilderness()
+                || Rs2Pvp.getWildernessLevelFrom(location) > 0;
         boolean hasBones = getLiveDragonBoneCount() > 0;
+        intentionallySuiciding = inWilderness && !hasBones;
 
         if (!stateInitialized)
         {
             wasInWilderness = inWilderness;
             mustBankBeforeTravel = !inWilderness && (!hasBones || !hasBurningAmulet());
+            if (mustBankBeforeTravel)
+            {
+                selectedBank = selectNearbyStartupBank(location);
+            }
             stateInitialized = true;
         }
 
         if (wasInWilderness && !inWilderness)
         {
+            ShortestPathPlugin.exit();
             mustBankBeforeTravel = true;
             status = "Respawned - banking";
         }
         wasInWilderness = inWilderness;
 
+        // Latch the completed trip before the death/respawn transition. During that
+        // transition the client can briefly report the previous inventory, so the
+        // live bone count alone is not a safe signal that another trip is ready.
+        if (inWilderness && !hasBones)
+        {
+            mustBankBeforeTravel = true;
+            intentionallySuiciding = true;
+        }
+
         if (!inWilderness && (mustBankBeforeTravel || !hasBones || !hasBurningAmulet()))
         {
             mustBankBeforeTravel = true;
-            bankAtRespawn();
+            bankAtRespawn(location);
             return;
         }
 
         if (!inWilderness)
         {
-            status = "Travelling to altar";
-            Rs2Walker.walkTo(CHAOS_ALTAR_APPROACH);
+            travelToAltar();
             return;
         }
 
@@ -166,9 +217,15 @@ public class DroChaosScript extends Script
         suicideWithWine();
     }
 
-    private void bankAtRespawn()
+    private void bankAtRespawn(WorldPoint location)
     {
-        BankLocation bank = selectRespawnBank();
+        if (selectedBank == null)
+        {
+            selectedBank = selectRespawnBank(location);
+            bankingStage = BankingStage.OPEN_BANK;
+        }
+
+        BankLocation bank = selectedBank;
         if (bank == BankLocation.EDGEVILLE)
         {
             bankName = "Edgeville";
@@ -177,51 +234,156 @@ public class DroChaosScript extends Script
         {
             bankName = "Lumbridge basement";
         }
-        else
+        else if (bank == BankLocation.LUMBRIDGE_TOP)
         {
             bankName = "Lumbridge upstairs";
         }
+        else
+        {
+            bankName = bank.toString();
+        }
         status = "Banking " + bankName.toLowerCase();
 
-        if (!Rs2Bank.isOpen() && !Rs2Bank.walkToBankAndUseBank(bank))
+        switch (bankingStage)
         {
-            return;
-        }
+            case OPEN_BANK:
+                int distanceToSelectedBank = Rs2Walker.getDistanceBetween(location, bank.getWorldPoint());
+                if (Rs2Bank.isOpen() && distanceToSelectedBank > 8)
+                {
+                    Rs2Bank.closeBank();
+                    return;
+                }
+                if (!Rs2Bank.isOpen())
+                {
+                    if (distanceToSelectedBank > 8)
+                    {
+                        if (bank == BankLocation.LUMBRIDGE_BASEMENT
+                                && LUMBRIDGE_UNDERGROUND_AREA.contains(location))
+                        {
+                            Rs2Walker.walkFastCanvas(bank.getWorldPoint());
+                        }
+                        else
+                        {
+                            Rs2Walker.walkTo(bank.getWorldPoint());
+                        }
+                        return;
+                    }
 
-        int liveBoneCount = getLiveDragonBoneCount();
-        if (liveBoneCount == 0 && Rs2Inventory.count() > 0)
-        {
-            Rs2Bank.depositAll();
-        }
+                    GameObject bankObject = Rs2GameObject.findBank(12);
+                    if (bankObject == null && bank == BankLocation.LUMBRIDGE_BASEMENT)
+                    {
+                        basementBankMisses++;
+                        if (basementBankMisses >= 5)
+                        {
+                            ShortestPathPlugin.exit();
+                            selectedBank = BankLocation.LUMBRIDGE_TOP;
+                            bankingStage = BankingStage.OPEN_BANK;
+                            basementBankMisses = 0;
+                            status = "Basement bank unavailable - using upstairs";
+                        }
+                        return;
+                    }
 
-        if (!Rs2Bank.hasItem(ItemID.DRAGON_BONES))
-        {
-            stopForMissingSupply("No Dragon bones in bank");
-            return;
-        }
-
-        if (!hasBurningAmulet())
-        {
-            int amuletId = firstChargedBurningAmuletInBank();
-            if (amuletId == -1)
-            {
-                stopForMissingSupply("No charged Burning amulet in bank");
+                    basementBankMisses = 0;
+                    if (bankObject != null)
+                    {
+                        Rs2Bank.openBank(bankObject);
+                    }
+                    else
+                    {
+                        Rs2Bank.openBank();
+                    }
+                    return;
+                }
+                boneWithdrawalIssued = false;
+                bankingStage = BankingStage.CLEAR_INVENTORY;
                 return;
-            }
-            Rs2Bank.withdrawAndEquip(amuletId);
-            Rs2Inventory.waitForInventoryChanges(2000);
-        }
 
-        if (getLiveDragonBoneCount() == 0)
-        {
-            Rs2Bank.withdrawAll(ItemID.DRAGON_BONES);
-            sleepUntil(() -> getLiveDragonBoneCount() > 0, 3000);
-        }
+            case CLEAR_INVENTORY:
+                if (!Rs2Bank.isOpen())
+                {
+                    bankingStage = BankingStage.OPEN_BANK;
+                    return;
+                }
+                if (Rs2Inventory.count() > 0 || getLiveDragonBoneCount() > 0)
+                {
+                    Rs2Bank.depositAll();
+                    sleepUntil(() -> Rs2Inventory.count() == 0
+                            && getLiveDragonBoneCount() == 0, 3000);
+                    return;
+                }
+                bankingStage = BankingStage.EQUIP_AMULET;
+                return;
 
-        if (getLiveDragonBoneCount() > 0 && hasBurningAmulet() && Rs2Bank.closeBank())
-        {
-            mustBankBeforeTravel = false;
-            status = "Supplies ready";
+            case EQUIP_AMULET:
+                if (hasBurningAmulet())
+                {
+                    bankingStage = BankingStage.WITHDRAW_BONES;
+                    return;
+                }
+
+                int amuletId = firstChargedBurningAmuletInBank();
+                if (amuletId == -1)
+                {
+                    stopForMissingSupply("No charged Burning amulet in bank");
+                    return;
+                }
+                Rs2Bank.withdrawAndEquip(amuletId);
+                sleepUntil(this::hasBurningAmulet, 3000);
+                return;
+
+            case WITHDRAW_BONES:
+                if (!boneWithdrawalIssued)
+                {
+                    if (!Rs2Bank.hasItem(ItemID.DRAGON_BONES))
+                    {
+                        stopForMissingSupply("No Dragon bones in bank");
+                        return;
+                    }
+                    if (Rs2Bank.withdrawAll(ItemID.DRAGON_BONES))
+                    {
+                        boneWithdrawalIssued = true;
+                        sleepUntil(() -> getLiveDragonBoneCount() > 0, 3000);
+                    }
+                    return;
+                }
+
+                if (getLiveDragonBoneCount() == 0)
+                {
+                    boneWithdrawalIssued = false;
+                    return;
+                }
+                bankingStage = BankingStage.VERIFY_SUPPLIES;
+                return;
+
+            case VERIFY_SUPPLIES:
+                if (getLiveDragonBoneCount() == 0)
+                {
+                    bankingStage = BankingStage.WITHDRAW_BONES;
+                    return;
+                }
+                if (!hasBurningAmulet())
+                {
+                    bankingStage = BankingStage.EQUIP_AMULET;
+                    return;
+                }
+                bankingStage = BankingStage.CLOSE_BANK;
+                return;
+
+            case CLOSE_BANK:
+                if (Rs2Bank.closeBank())
+                {
+                    mustBankBeforeTravel = false;
+                    selectedBank = null;
+                    boneWithdrawalIssued = false;
+                    basementBankMisses = 0;
+                    bankingStage = BankingStage.OPEN_BANK;
+                    status = "Supplies ready";
+                }
+                return;
+
+            default:
+                bankingStage = BankingStage.OPEN_BANK;
         }
     }
 
@@ -247,26 +409,59 @@ public class DroChaosScript extends Script
         }).orElse(0);
     }
 
-    private BankLocation selectRespawnBank()
+    private WorldPoint getSafeWorldLocation()
     {
-        WorldPoint location = Rs2Player.getWorldLocation();
-        if (location != null && EDGEVILLE_RESPAWN_AREA.contains(location))
+        return Microbot.getClientThread().runOnClientThreadOptional(() -> {
+            Client client = Microbot.getClient();
+            Player localPlayer = client == null ? null : client.getLocalPlayer();
+            return localPlayer == null ? null : localPlayer.getWorldLocation();
+        }).orElse(null);
+    }
+
+    private BankLocation selectRespawnBank(WorldPoint location)
+    {
+        if (EDGEVILLE_RESPAWN_AREA.contains(location))
         {
             return BankLocation.EDGEVILLE;
         }
-        if (location != null && LUMBRIDGE_BASEMENT_AREA.contains(location))
+        if (LUMBRIDGE_UNDERGROUND_AREA.contains(location)
+                || LUMBRIDGE_BASEMENT_AREA.contains(location))
         {
             return BankLocation.LUMBRIDGE_BASEMENT;
         }
-        return hasLumbridgeBasementAccess()
-                ? BankLocation.LUMBRIDGE_BASEMENT
-                : BankLocation.LUMBRIDGE_TOP;
+        return BankLocation.LUMBRIDGE_BASEMENT;
     }
 
-    private boolean hasLumbridgeBasementAccess()
+    private BankLocation selectNearbyStartupBank(WorldPoint location)
     {
-        return Rs2Player.getQuestState(Quest.RECIPE_FOR_DISASTER__ANOTHER_COOKS_QUEST)
-                == QuestState.FINISHED;
+        if (LUMBRIDGE_UNDERGROUND_AREA.contains(location))
+        {
+            return BankLocation.LUMBRIDGE_BASEMENT;
+        }
+
+        if (Rs2Bank.isOpen() || Rs2Bank.isNearBank(12) || Rs2GameObject.findBank(12) != null)
+        {
+            return Rs2Bank.getNearestBank(location, 12);
+        }
+        return null;
+    }
+
+    private void travelToAltar()
+    {
+        status = "Teleporting to Lava Maze";
+        if (Rs2Equipment.interact(CHARGED_BURNING_AMULETS, "Lava Maze")
+                && sleepUntil(Rs2Dialogue::isInDialogue, 2000))
+        {
+            Rs2Dialogue.clickOption("Okay, teleport to level");
+            sleepUntil(() -> {
+                WorldPoint location = getSafeWorldLocation();
+                return location != null && Rs2Pvp.getWildernessLevelFrom(location) > 0;
+            }, 5000);
+            return;
+        }
+
+        status = "Travelling to altar";
+        Rs2Walker.walkTo(CHAOS_ALTAR_APPROACH);
     }
 
     private boolean hasBurningAmulet()
@@ -313,6 +508,13 @@ public class DroChaosScript extends Script
         status = "Offering bones";
         if (Rs2Inventory.interact(bone, "use"))
         {
+            // Set this before the last bone can disappear so a respawn can never
+            // reuse stale inventory state and immediately begin another trip.
+            if (getLiveDragonBoneCount() <= 1)
+            {
+                mustBankBeforeTravel = true;
+                intentionallySuiciding = true;
+            }
             sleep(config.fastOffering() ? 50 : 150, config.fastOffering() ? 125 : 225);
             Microbot.getRs2TileObjectCache().query().withId(CHAOS_ALTAR_ID).interact("Use");
             Rs2Player.waitForXpDrop(Skill.PRAYER);
@@ -333,11 +535,7 @@ public class DroChaosScript extends Script
     private void suicideWithWine()
     {
         status = "Suiciding on wine";
-
-        if (logoutForThreat())
-        {
-            return;
-        }
+        intentionallySuiciding = true;
 
         if (Rs2Inventory.contains("Wine of zamorak"))
         {
@@ -461,6 +659,11 @@ public class DroChaosScript extends Script
         stateInitialized = false;
         wasInWilderness = false;
         mustBankBeforeTravel = false;
+        intentionallySuiciding = false;
+        bankingStage = BankingStage.OPEN_BANK;
+        selectedBank = null;
+        boneWithdrawalIssued = false;
+        basementBankMisses = 0;
         threatLogoutActive.set(false);
         status = "Idle";
         bankName = "Detecting";

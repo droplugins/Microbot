@@ -2,8 +2,6 @@ package net.runelite.client.plugins.microbot.drochaos;
 
 import lombok.Getter;
 import net.runelite.api.Client;
-import net.runelite.api.CollisionDataFlag;
-import net.runelite.api.Point;
 import net.runelite.api.InventoryID;
 import net.runelite.api.Item;
 import net.runelite.api.ItemContainer;
@@ -12,11 +10,9 @@ import net.runelite.api.Player;
 import net.runelite.api.Skill;
 import net.runelite.api.WorldType;
 import net.runelite.api.coords.WorldArea;
-import net.runelite.api.coords.LocalPoint;
 import net.runelite.api.coords.WorldPoint;
 import net.runelite.client.plugins.microbot.Microbot;
 import net.runelite.client.plugins.microbot.Script;
-import net.runelite.client.plugins.microbot.api.tileobject.models.Rs2TileObjectModel;
 import net.runelite.client.plugins.microbot.shortestpath.ShortestPathPlugin;
 import net.runelite.client.plugins.microbot.util.antiban.Rs2Antiban;
 import net.runelite.client.plugins.microbot.util.bank.Rs2Bank;
@@ -31,10 +27,8 @@ import net.runelite.client.plugins.microbot.util.player.Rs2Player;
 import net.runelite.client.plugins.microbot.util.player.Rs2Pvp;
 import net.runelite.client.plugins.microbot.util.tabs.Rs2Tab;
 import net.runelite.client.plugins.microbot.util.walker.Rs2Walker;
-import net.runelite.client.plugins.microbot.util.walker.Rs2MiniMap;
 import net.runelite.client.plugins.microbot.util.widget.Rs2Widget;
 
-import java.util.Comparator;
 import java.util.List;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.ThreadLocalRandom;
@@ -43,7 +37,6 @@ import java.util.concurrent.atomic.AtomicBoolean;
 public class DroChaosScript extends Script
 {
     private static final int CHAOS_ALTAR_ID = 411;
-    private static final int CHAOS_TEMPLE_LARGE_DOOR_ID = 18449;
     private static final int MINIMUM_COMBAT_LEVEL = 3;
     private static final int MAXIMUM_COMBAT_LEVEL = 126;
     private static final int[] CHARGED_BURNING_AMULETS = {
@@ -60,8 +53,8 @@ public class DroChaosScript extends Script
     private static final WorldArea EDGEVILLE_RESPAWN = new WorldArea(3060, 3450, 66, 70, 0);
     private static final long MIN_MISCLICK_INTERVAL_MS = TimeUnit.MINUTES.toMillis(5);
     private static final long MAX_MISCLICK_INTERVAL_MS = TimeUnit.MINUTES.toMillis(15);
-    private static final int MIN_ACTION_DELAY_MS = 100;
-    private static final int MAX_ACTION_DELAY_MS = 350;
+    private static final int MIN_ACTION_DELAY_MS = 50;
+    private static final int MAX_ACTION_DELAY_MS = 250;
 
     private static final WorldPoint[] PATH_TO_ALTAR = {
             new WorldPoint(3025, 3836, 0),
@@ -82,15 +75,6 @@ public class DroChaosScript extends Script
     private volatile boolean intentionallySuiciding;
     private long nextMisclickAt;
     private long nextBankActionAt;
-    private long nextMovementAt;
-    private long nextDoorActionAt;
-    private boolean slowOfferingActive;
-    private int slowOfferingBoneCount;
-    private long slowOfferingProgressAt;
-    private WorldPoint lastMovementTarget;
-    private WorldPoint lastMinimapTile;
-    private WorldPoint lastMovementPosition;
-    private long lastMovementProgressAt;
     private final AtomicBoolean threatLogoutActive = new AtomicBoolean(false);
 
     @Getter
@@ -109,15 +93,6 @@ public class DroChaosScript extends Script
         intentionallySuiciding = false;
         scheduleNextMisclick();
         nextBankActionAt = 0L;
-        nextMovementAt = 0L;
-        nextDoorActionAt = 0L;
-        slowOfferingActive = false;
-        slowOfferingBoneCount = 0;
-        slowOfferingProgressAt = 0L;
-        lastMovementTarget = null;
-        lastMinimapTile = null;
-        lastMovementPosition = null;
-        lastMovementProgressAt = 0L;
 
         scheduledFuture = scheduledExecutorService.scheduleWithFixedDelay(() -> {
             try
@@ -231,7 +206,8 @@ public class DroChaosScript extends Script
             else if (EDGEVILLE_RESPAWN.contains(location))
             {
                 status = "Walking to Edgeville bank";
-                walkMinimapThrottled(BankLocation.EDGEVILLE.getWorldPoint(), location);
+                pauseBeforeAction();
+                Rs2Walker.walkFastCanvas(BankLocation.EDGEVILLE.getWorldPoint());
             }
             else
             {
@@ -243,182 +219,29 @@ public class DroChaosScript extends Script
     private void walkToAltarAndSacrifice()
     {
         WorldPoint location = getSafeWorldLocation();
-        if (location == null)
-        {
-            return;
-        }
-        WorldPoint altar = PATH_TO_ALTAR[PATH_TO_ALTAR.length - 1];
 
-        if (CHAOS_TEMPLE.contains(location) && location.distanceTo(altar) <= 1)
+        if (CHAOS_TEMPLE.contains(location))
         {
-            if (config.fastOffering())
-            {
-                offerBonesFast();
-            }
-            else
-            {
-                offerBonesSlow();
-            }
-            return;
-        }
-
-        WorldPoint entrance = PATH_TO_ALTAR[PATH_TO_ALTAR.length - 2];
-        if (location.distanceTo(entrance) <= 3 || CHAOS_TEMPLE.contains(location))
-        {
-            status = "Entering temple";
-            if (!handleTempleDoor())
-            {
-                walkMinimapThrottled(altar, location);
-            }
+            offerBonesFast();
             return;
         }
 
         status = "Walking to altar";
         WorldPoint target = getNextWaypoint(location);
-        if (altar.equals(target))
-        {
-            target = entrance;
-        }
 
         if (target != null && location.distanceTo(target) > 1)
         {
-            walkMinimapThrottled(target, location);
-        }
-    }
-
-    private boolean handleTempleDoor()
-    {
-        Rs2TileObjectModel door = findClosedTempleDoor();
-        if (door == null)
-        {
-            // Allow the server's door/collision update to settle before walking.
-            return System.currentTimeMillis() < nextDoorActionAt;
-        }
-        status = "Opening temple door";
-        if (System.currentTimeMillis() < nextDoorActionAt)
-        {
-            return true;
-        }
-        if (Rs2Inventory.isItemSelected())
-        {
             pauseBeforeAction();
-            Rs2Inventory.deselect();
-            return true;
+            Rs2Walker.walkFastCanvas(target);
         }
-        pauseBeforeAction();
-        Microbot.getRs2TileObjectCache().query()
-                .withId(door.getId())
-                .where(object -> door.getWorldLocation().equals(object.getWorldLocation()))
-                .interact("Open");
-        nextDoorActionAt = System.currentTimeMillis() + 2200L;
-        return true;
-    }
-
-    private Rs2TileObjectModel findClosedTempleDoor()
-    {
-        WorldPoint altar = PATH_TO_ALTAR[PATH_TO_ALTAR.length - 1];
-        return Microbot.getClientThread().runOnClientThreadOptional(() ->
-                Microbot.getRs2TileObjectCache().query()
-                        .within(altar, 12)
-                        .where(object -> {
-                            if (object.getId() == CHAOS_TEMPLE_LARGE_DOOR_ID) return true;
-                            var composition = object.getObjectComposition();
-                            if (composition == null) return false;
-                            if (composition.getImpostorIds() != null)
-                            {
-                                composition = composition.getImpostor();
-                            }
-                            if (composition == null || composition.getActions() == null) return false;
-                            String name = composition.getName();
-                            if (!"Large door".equalsIgnoreCase(name) && !"Door".equalsIgnoreCase(name)) return false;
-                            for (String action : composition.getActions())
-                            {
-                                if ("Open".equalsIgnoreCase(action)) return true;
-                            }
-                            return false;
-                        })
-                        .nearest()).orElse(null);
-    }
-
-    private void walkMinimapThrottled(WorldPoint target, WorldPoint location)
-    {
-        long now = System.currentTimeMillis();
-        if (!location.equals(lastMovementPosition))
-        {
-            lastMovementPosition = location;
-            lastMovementProgressAt = now;
-        }
-        if (now < nextMovementAt)
-        {
-            return;
-        }
-        if (target.equals(lastMovementTarget) && Rs2Player.isMoving()
-                && lastMinimapTile != null && location.distanceTo(lastMinimapTile) > 3
-                && now - lastMovementProgressAt < 1800L)
-        {
-            return;
-        }
-        pauseBeforeAction();
-        if (clickRouteMinimap(target, location))
-        {
-            lastMovementTarget = target;
-        }
-        nextMovementAt = System.currentTimeMillis()
-                + ThreadLocalRandom.current().nextLong(1300L, 1801L);
-    }
-
-    private boolean clickRouteMinimap(WorldPoint target, WorldPoint location)
-    {
-        int distance = location.distanceTo(target);
-        if (distance == 0 || location.getPlane() != target.getPlane()) return false;
-        // Shorten an off-minimap leg without ever falling back to a floor click.
-        for (int step = Math.min(distance, 16); step >= 1; step--)
-        {
-            WorldPoint base = new WorldPoint(
-                    location.getX() + (int) Math.round((target.getX() - location.getX()) * (double) step / distance),
-                    location.getY() + (int) Math.round((target.getY() - location.getY()) * (double) step / distance),
-                    location.getPlane());
-            boolean vary = base.getX() >= 2970 && target.getX() >= 2970;
-            for (int attempt = 0; attempt < (vary ? 5 : 1); attempt++)
-            {
-                WorldPoint tile = vary && attempt < 4
-                        ? new WorldPoint(base.getX() + ThreadLocalRandom.current().nextInt(-1, 2),
-                                base.getY() + ThreadLocalRandom.current().nextInt(-1, 2), base.getPlane())
-                        : base;
-                if (tile.equals(location) || (vary && attempt < 4 && tile.equals(lastMinimapTile))) continue;
-                Point point = Microbot.getClientThread().runOnClientThreadOptional(() -> {
-                    var view = Microbot.getClient().getTopLevelWorldView();
-                    if (view == null || view.getCollisionMaps() == null) return null;
-                    LocalPoint local = LocalPoint.fromWorld(view, tile);
-                    if (local == null || view.getCollisionMaps()[tile.getPlane()] == null) return null;
-                    int[][] flags = view.getCollisionMaps()[tile.getPlane()].getFlags();
-                    int x = local.getSceneX(), y = local.getSceneY();
-                    if (x < 0 || x >= flags.length || y < 0 || y >= flags[x].length
-                            || (flags[x][y] & CollisionDataFlag.BLOCK_MOVEMENT_FULL) != 0) return null;
-                    Point projected = Rs2MiniMap.worldToMinimap(tile);
-                    return projected != null && Rs2MiniMap.isPointInsideMinimap(projected) ? projected : null;
-                }).orElse(null);
-                if (point != null)
-                {
-                    Microbot.getMouse().click(point);
-                    lastMinimapTile = tile;
-                    return true;
-                }
-            }
-        }
-        return false;
     }
 
     private WorldPoint getNextWaypoint(WorldPoint playerLoc)
     {
         for (int i = PATH_TO_ALTAR.length - 1; i >= 0; i--)
         {
-            if (playerLoc.distanceTo(PATH_TO_ALTAR[i]) <= 16)
+            if (playerLoc.distanceTo(PATH_TO_ALTAR[i]) < 16)
             {
-                if (playerLoc.distanceTo(PATH_TO_ALTAR[i]) <= 2 && i + 1 < PATH_TO_ALTAR.length)
-                {
-                    return PATH_TO_ALTAR[i + 1];
-                }
                 return PATH_TO_ALTAR[i];
             }
         }
@@ -515,47 +338,19 @@ public class DroChaosScript extends Script
 
     private void walkUpstairsLumbridge()
     {
-        WorldPoint location = getSafeWorldLocation();
-        if (location == null || location.getPlane() >= 2)
-        {
-            return;
-        }
-
-        int plane = location.getPlane();
-        // The middle-floor staircase has a different object ID and both
-        // directions. Never select a same-named staircase on another floor.
-        int staircaseId = plane == 0 ? 56230 : 16672;
-        String climbAction = plane == 0 ? "Top-floor" : "Climb-up";
-        Rs2TileObjectModel staircase = Microbot.getRs2TileObjectCache().query()
-                .withId(staircaseId)
-                .where(object -> object.getWorldLocation() != null
-                        && object.getWorldLocation().getPlane() == plane
-                        && object.getWorldLocation().distanceTo(location) <= 32)
-                .nearest();
-
         status = "Walking upstairs to bank";
         pauseBeforeAction();
-        if (staircase != null && Microbot.getRs2TileObjectCache().query()
-                .withId(staircaseId)
-                .where(object -> staircase.getWorldLocation().equals(object.getWorldLocation()))
-                .interact(climbAction))
+        boolean success = Rs2GameObject.interact("Staircase", "Climb-up");
+        if (success)
         {
-            boolean climbed = sleepUntil(() -> {
-                WorldPoint current = getSafeWorldLocation();
-                return current != null && current.getPlane() == 2;
-            }, 5000);
-            if (!climbed)
-            {
-                status = "Stair climb not confirmed - retrying";
-            }
+            sleepUntil(Rs2Player::isMoving, 1000);
+            sleepUntil(() -> !Rs2Player.isMoving(), 4000);
         }
         else
         {
-            WorldPoint south = new WorldPoint(3206, 3208, plane);
-            WorldPoint north = new WorldPoint(3206, 3229, plane);
-            WorldPoint stairsLoc = location.distanceTo(north) < location.distanceTo(south)
-                    ? north : south;
-            walkMinimapThrottled(stairsLoc, location);
+            WorldPoint stairsLoc = new WorldPoint(3205, 3208, Rs2Player.getWorldLocation().getPlane());
+            pauseBeforeAction();
+            Rs2Walker.walkFastCanvas(stairsLoc);
         }
     }
 
@@ -621,87 +416,23 @@ public class DroChaosScript extends Script
             return;
         }
 
-        for (Rs2ItemModel bone : bones)
-        {
-            if (bone == null || !Microbot.isLoggedIn())
-            {
-                break;
-            }
-
-            if (logoutForThreat())
-            {
-                return;
-            }
-
-            if (getLiveDragonBoneCount() <= 1)
-            {
-                intentionallySuiciding = true;
-            }
-
-            if (Rs2Inventory.interact(bone, "Use"))
-            {
-                sleep(15, 35);
-                Rs2GameObject.interact(CHAOS_ALTAR_ID, "Use");
-                sleep(40, 70);
-            }
-        }
-    }
-
-    private void offerBonesSlow()
-    {
-        if (logoutForThreat())
+        Rs2ItemModel bone = bones.get(bones.size() - 1);
+        if (bone == null || !Microbot.isLoggedIn())
         {
             return;
         }
 
-        int boneCount = getLiveDragonBoneCount();
-        if (boneCount <= 0)
+        if (getLiveDragonBoneCount() <= 1)
         {
-            slowOfferingActive = false;
             bankRequired = true;
             intentionallySuiciding = true;
-            return;
         }
 
-        long now = System.currentTimeMillis();
-        if (slowOfferingActive)
-        {
-            status = "Offering bones (Auto)";
-            if (boneCount < slowOfferingBoneCount)
-            {
-                slowOfferingBoneCount = boneCount;
-                slowOfferingProgressAt = now;
-            }
-            if (Rs2Player.isAnimating() || now - slowOfferingProgressAt < 3500L)
-            {
-                return;
-            }
-            slowOfferingActive = false;
-        }
-
-        List<Rs2ItemModel> bones = Rs2Inventory.getBones();
-        if (bones == null || bones.isEmpty())
-        {
-            return;
-        }
-        Rs2ItemModel bone = bones.stream()
-                .max(Comparator.comparingInt(Rs2ItemModel::getSlot))
-                .orElse(null);
-        if (bone == null)
-        {
-            return;
-        }
-
-        status = "Starting automatic offering";
+        pauseBeforeFastAction();
         if (Rs2Inventory.interact(bone, "Use"))
         {
-            sleep(15, 35);
-            if (Rs2GameObject.interact(CHAOS_ALTAR_ID, "Use"))
-            {
-                slowOfferingActive = true;
-                slowOfferingBoneCount = boneCount;
-                slowOfferingProgressAt = now;
-            }
+            pauseBeforeFastAction();
+            Rs2GameObject.interact(CHAOS_ALTAR_ID, "Use");
         }
     }
 
@@ -709,16 +440,6 @@ public class DroChaosScript extends Script
     {
         status = "Suiciding on wine";
         intentionallySuiciding = true;
-
-        WorldPoint location = getSafeWorldLocation();
-        WorldPoint altar = PATH_TO_ALTAR[PATH_TO_ALTAR.length - 1];
-        if (location == null) return;
-        if (!CHAOS_TEMPLE.contains(location)
-                && location.distanceTo(altar) > 1 && location.distanceTo(altar) <= 15
-                && handleTempleDoor())
-        {
-            return;
-        }
 
         if (Rs2Inventory.contains("Wine of zamorak"))
         {
@@ -739,9 +460,10 @@ public class DroChaosScript extends Script
         }
         else
         {
-            if (location.distanceTo(altar) > 3)
+            if (Rs2Player.getWorldLocation().distanceTo(new WorldPoint(2949, 3820, 0)) > 3)
             {
-                walkMinimapThrottled(altar, location);
+                pauseBeforeAction();
+                Rs2Walker.walkFastCanvas(new WorldPoint(2949, 3820, 0));
             }
         }
     }
@@ -754,6 +476,11 @@ public class DroChaosScript extends Script
             delay += ThreadLocalRandom.current().nextInt(100, 351);
         }
         sleep(delay);
+    }
+
+    private void pauseBeforeFastAction()
+    {
+        sleep(ThreadLocalRandom.current().nextInt(MIN_ACTION_DELAY_MS, 126));
     }
 
     private boolean handleScheduledMisclick(boolean inWilderness)
@@ -867,6 +594,7 @@ public class DroChaosScript extends Script
         {
             status = "Threat detected - logging out";
             Microbot.log("DroChaos: threatening player detected; logging out");
+            pauseBeforeAction();
             Rs2Player.logout();
             sleep(500, 800);
         }

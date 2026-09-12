@@ -34,7 +34,6 @@ import net.runelite.client.plugins.microbot.util.walker.Rs2Walker;
 import net.runelite.client.plugins.microbot.util.walker.Rs2MiniMap;
 import net.runelite.client.plugins.microbot.util.widget.Rs2Widget;
 
-import java.util.Comparator;
 import java.util.List;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.ThreadLocalRandom;
@@ -43,7 +42,6 @@ import java.util.concurrent.atomic.AtomicBoolean;
 public class DroChaosScript extends Script
 {
     private static final int CHAOS_ALTAR_ID = 411;
-    private static final int CHAOS_TEMPLE_LARGE_DOOR_ID = 18449;
     private static final int MINIMUM_COMBAT_LEVEL = 3;
     private static final int MAXIMUM_COMBAT_LEVEL = 126;
     private static final int[] CHARGED_BURNING_AMULETS = {
@@ -60,8 +58,8 @@ public class DroChaosScript extends Script
     private static final WorldArea EDGEVILLE_RESPAWN = new WorldArea(3060, 3450, 66, 70, 0);
     private static final long MIN_MISCLICK_INTERVAL_MS = TimeUnit.MINUTES.toMillis(5);
     private static final long MAX_MISCLICK_INTERVAL_MS = TimeUnit.MINUTES.toMillis(15);
-    private static final int MIN_ACTION_DELAY_MS = 100;
-    private static final int MAX_ACTION_DELAY_MS = 350;
+    private static final int MIN_ACTION_DELAY_MS = 50;
+    private static final int MAX_ACTION_DELAY_MS = 250;
 
     private static final WorldPoint[] PATH_TO_ALTAR = {
             new WorldPoint(3025, 3836, 0),
@@ -84,9 +82,6 @@ public class DroChaosScript extends Script
     private long nextBankActionAt;
     private long nextMovementAt;
     private long nextDoorActionAt;
-    private boolean slowOfferingActive;
-    private int slowOfferingBoneCount;
-    private long slowOfferingProgressAt;
     private WorldPoint lastMovementTarget;
     private WorldPoint lastMinimapTile;
     private WorldPoint lastMovementPosition;
@@ -111,9 +106,6 @@ public class DroChaosScript extends Script
         nextBankActionAt = 0L;
         nextMovementAt = 0L;
         nextDoorActionAt = 0L;
-        slowOfferingActive = false;
-        slowOfferingBoneCount = 0;
-        slowOfferingProgressAt = 0L;
         lastMovementTarget = null;
         lastMinimapTile = null;
         lastMovementPosition = null;
@@ -251,14 +243,7 @@ public class DroChaosScript extends Script
 
         if (CHAOS_TEMPLE.contains(location) && location.distanceTo(altar) <= 1)
         {
-            if (config.fastOffering())
-            {
-                offerBonesFast();
-            }
-            else
-            {
-                offerBonesSlow();
-            }
+            offerBonesFast();
             return;
         }
 
@@ -310,7 +295,7 @@ public class DroChaosScript extends Script
                 .withId(door.getId())
                 .where(object -> door.getWorldLocation().equals(object.getWorldLocation()))
                 .interact("Open");
-        nextDoorActionAt = System.currentTimeMillis() + 2200L;
+        nextDoorActionAt = System.currentTimeMillis() + 1800L;
         return true;
     }
 
@@ -319,9 +304,9 @@ public class DroChaosScript extends Script
         WorldPoint altar = PATH_TO_ALTAR[PATH_TO_ALTAR.length - 1];
         return Microbot.getClientThread().runOnClientThreadOptional(() ->
                 Microbot.getRs2TileObjectCache().query()
+                        .withName("Door")
                         .within(altar, 12)
                         .where(object -> {
-                            if (object.getId() == CHAOS_TEMPLE_LARGE_DOOR_ID) return true;
                             var composition = object.getObjectComposition();
                             if (composition == null) return false;
                             if (composition.getImpostorIds() != null)
@@ -329,8 +314,6 @@ public class DroChaosScript extends Script
                                 composition = composition.getImpostor();
                             }
                             if (composition == null || composition.getActions() == null) return false;
-                            String name = composition.getName();
-                            if (!"Large door".equalsIgnoreCase(name) && !"Door".equalsIgnoreCase(name)) return false;
                             for (String action : composition.getActions())
                             {
                                 if ("Open".equalsIgnoreCase(action)) return true;
@@ -364,7 +347,7 @@ public class DroChaosScript extends Script
             lastMovementTarget = target;
         }
         nextMovementAt = System.currentTimeMillis()
-                + ThreadLocalRandom.current().nextLong(1300L, 1801L);
+                + ThreadLocalRandom.current().nextLong(900L, 1201L);
     }
 
     private boolean clickRouteMinimap(WorldPoint target, WorldPoint location)
@@ -623,84 +606,30 @@ public class DroChaosScript extends Script
 
         for (Rs2ItemModel bone : bones)
         {
-            if (bone == null || !Microbot.isLoggedIn())
+            if (bone == null || !Microbot.isLoggedIn() || Thread.currentThread().isInterrupted())
             {
                 break;
             }
-
+            WorldPoint location = getSafeWorldLocation();
+            if (location == null || !CHAOS_TEMPLE.contains(location)
+                    || location.distanceTo(PATH_TO_ALTAR[PATH_TO_ALTAR.length - 1]) > 1)
+            {
+                return;
+            }
             if (logoutForThreat())
             {
                 return;
             }
-
             if (getLiveDragonBoneCount() <= 1)
             {
+                bankRequired = true;
                 intentionallySuiciding = true;
             }
-
             if (Rs2Inventory.interact(bone, "Use"))
             {
                 sleep(15, 35);
                 Rs2GameObject.interact(CHAOS_ALTAR_ID, "Use");
                 sleep(40, 70);
-            }
-        }
-    }
-
-    private void offerBonesSlow()
-    {
-        if (logoutForThreat())
-        {
-            return;
-        }
-
-        int boneCount = getLiveDragonBoneCount();
-        if (boneCount <= 0)
-        {
-            slowOfferingActive = false;
-            bankRequired = true;
-            intentionallySuiciding = true;
-            return;
-        }
-
-        long now = System.currentTimeMillis();
-        if (slowOfferingActive)
-        {
-            status = "Offering bones (Auto)";
-            if (boneCount < slowOfferingBoneCount)
-            {
-                slowOfferingBoneCount = boneCount;
-                slowOfferingProgressAt = now;
-            }
-            if (Rs2Player.isAnimating() || now - slowOfferingProgressAt < 3500L)
-            {
-                return;
-            }
-            slowOfferingActive = false;
-        }
-
-        List<Rs2ItemModel> bones = Rs2Inventory.getBones();
-        if (bones == null || bones.isEmpty())
-        {
-            return;
-        }
-        Rs2ItemModel bone = bones.stream()
-                .max(Comparator.comparingInt(Rs2ItemModel::getSlot))
-                .orElse(null);
-        if (bone == null)
-        {
-            return;
-        }
-
-        status = "Starting automatic offering";
-        if (Rs2Inventory.interact(bone, "Use"))
-        {
-            sleep(15, 35);
-            if (Rs2GameObject.interact(CHAOS_ALTAR_ID, "Use"))
-            {
-                slowOfferingActive = true;
-                slowOfferingBoneCount = boneCount;
-                slowOfferingProgressAt = now;
             }
         }
     }
@@ -713,8 +642,7 @@ public class DroChaosScript extends Script
         WorldPoint location = getSafeWorldLocation();
         WorldPoint altar = PATH_TO_ALTAR[PATH_TO_ALTAR.length - 1];
         if (location == null) return;
-        if (!CHAOS_TEMPLE.contains(location)
-                && location.distanceTo(altar) > 1 && location.distanceTo(altar) <= 15
+        if (location.distanceTo(altar) > 1 && location.distanceTo(altar) <= 15
                 && handleTempleDoor())
         {
             return;
@@ -867,6 +795,7 @@ public class DroChaosScript extends Script
         {
             status = "Threat detected - logging out";
             Microbot.log("DroChaos: threatening player detected; logging out");
+            pauseBeforeAction();
             Rs2Player.logout();
             sleep(500, 800);
         }

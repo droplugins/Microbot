@@ -23,7 +23,11 @@ public class DroChaosOverlay extends OverlayPanel
         panelComponent.getChildren().clear();
         panelComponent.getChildren().add(LineComponent.builder()
                 .left("[Dro] Chaos Temple")
-                .right("v" + DroChaosPlugin.VERSION)
+                .right(script.getStatus())
+                .build());
+        panelComponent.getChildren().add(LineComponent.builder()
+                .left("Lumbridge bank")
+                .right(script.getBankName())
                 .build());
         return super.render(graphics);
     }

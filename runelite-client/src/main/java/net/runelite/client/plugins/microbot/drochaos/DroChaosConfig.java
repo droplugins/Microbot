@@ -15,8 +15,8 @@ public interface DroChaosConfig extends Config
 
     @ConfigItem(
             keyName = "fastOffering",
-            name = "Offer bones quickly",
-            description = "Use each bone on the altar as soon as the previous offering completes.",
+            name = "Fast bone offering",
+            description = "Enabled: rapidly offer bones in randomized last-to-first order. Disabled: use one bone and let automatic offering continue.",
             position = 0
     )
     default boolean fastOffering()
